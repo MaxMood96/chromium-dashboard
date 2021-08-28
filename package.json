@@ -84,6 +84,6 @@
     "node-fetch": ">=2.6.1",
     "node-sass": ">=4.13.1",
     "urijs": ">=1.19.6",
-    "yargs-parser": ">=13.1.2"
+    "yargs-parser": ">=20.2.9"
   }
 }
