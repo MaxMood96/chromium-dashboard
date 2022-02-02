@@ -1,6 +1,6 @@
 
 # Libraries that we use directly.
-Django==1.11.29
+Django==2.2.27
 mock==3.0.5
 funcsigs
 Flask==1.1.2
