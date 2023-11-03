@@ -33,3 +33,4 @@ pyparsing==2.4.7
 
 # OpenAPI files
 ./gen/py/chromestatus_openapi
+pillow>=10.0.0 # not directly required, pinned by Snyk to avoid a vulnerability
