@@ -18,7 +18,10 @@ import settings
 from datetime import datetime
 from unittest import mock
 
+from internals import approval_defs
+from internals import core_enums
 from internals.core_models import FeatureEntry, MilestoneSet, Stage
+from internals.review_models import Gate, Vote
 from internals import reminders
 
 from google.cloud import ndb  # type: ignore
@@ -91,11 +94,18 @@ class FunctionTest(testing_config.CustomTestCase):
       editor_emails=['feature_editor@example.com'],
       spec_mentor_emails=['mentor@example.com'],
       category=1, feature_type=0)
-    stages = [110, 120, 130, 140, 150, 151, 160]
+    stages = [110, 120, 130, 140, 150, 151, 160, 1061]
     for stage_type in stages:
       stage = Stage(feature_id=123, stage_type=stage_type)
+      # OT stage.
       if stage_type == 150:
-        stage.milestones = MilestoneSet(desktop_first=100)
+        stage.milestones = MilestoneSet(desktop_first=100, desktop_last=105)
+      # OT extension stage.
+      if stage_type == 151:
+        stage.milestones = MilestoneSet(desktop_last=108)
+      # Enterprise rollout stage.
+      if stage_type == 1061:
+        stage.rollout_milestone = 110
       stage.put()
 
     self.feature_template.put()
@@ -107,6 +117,28 @@ class FunctionTest(testing_config.CustomTestCase):
     for kind in kinds:
       for entity in kind.query():
         entity.key.delete()
+
+  def test_choose_email_recipients__normal(self):
+    """Normal reminders go to feature participants."""
+    actual = reminders.choose_email_recipients(
+        self.feature_template, False)
+    expected = ['feature_owner@example.com',
+                ]
+    self.assertEqual(set(actual), set(expected))
+
+  @mock.patch('settings.PROD', True)
+  def test_choose_email_recipients__escalated(self):
+    """Escalated reminders go to feature participants and lists."""
+    actual = reminders.choose_email_recipients(
+        self.feature_template, True)
+    expected = ['creator@example.com',
+                'feature_owner@example.com',
+                'feature_editor@example.com',
+                'mentor@example.com',
+                'webstatus@google.com',
+                'cbe-releasenotes@google.com',
+                ]
+    self.assertEqual(set(actual), set(expected))
 
   def test_build_email_tasks_feature_accuracy(self):
     with test_app.app_context():
@@ -126,6 +158,26 @@ class FunctionTest(testing_config.CustomTestCase):
     # TESTDATA.make_golden(task['html'], 'test_build_email_tasks_feature_accuracy.html')
     self.assertMultiLineEqual(
       TESTDATA['test_build_email_tasks_feature_accuracy.html'], task['html'])
+
+  def test_build_email_tasks_feature_accuracy__enterprise(self):
+    with test_app.app_context():
+      handler = reminders.FeatureAccuracyHandler()
+      actual = reminders.build_email_tasks(
+          [(self.feature_template, 110)],
+          '[Action requested] Update %s',
+          handler.EMAIL_TEMPLATE_PATH,
+          self.current_milestone_info,
+          handler.should_escalate_notification)
+
+    self.assertEqual(1, len(actual))
+    task = actual[0]
+    self.assertEqual('feature_owner@example.com', task['to'])
+    self.assertEqual('[Action requested] Update feature one', task['subject'])
+    self.assertEqual(None, task['reply_to'])
+    # TESTDATA.make_golden(task['html'], 'test_build_email_tasks_feature_accuracy_enterprise.html')
+    self.assertMultiLineEqual(
+        TESTDATA['test_build_email_tasks_feature_accuracy_enterprise.html'],
+        task['html'])
 
   def test_build_email_tasks_feature_accuracy__escalated(self):
     # Set feature to have outstanding notifications to cause escalation.
@@ -296,3 +348,136 @@ class PrepublicationHandlerTest(testing_config.CustomTestCase):
     actual = self.handler.prefilter_features(
         self.current_milestone_info, features, now=mock_now)
     self.assertEqual(['mock feature'], actual)
+
+
+class SLOOverdueHandlerTest(testing_config.CustomTestCase):
+
+  def setUp(self):
+    self.feature_1, self.feature_2, self.feature_3 = make_test_features()
+    self.gate_1 = Gate(
+        feature_id=self.feature_1.key.integer_id(),
+        stage_id=1111, gate_type=core_enums.GATE_ENTERPRISE_SHIP,
+        state=Gate.PREPARING)
+    self.gate_1.put()
+    self.handler = reminders.SLOOverdueHandler()
+    # Just a non-empty date, the value is ignored by mock_remaining_days
+    self.request_date = datetime(2023, 6, 7, 12, 30, 0)
+
+  def tearDown(self) -> None:
+    kinds: list[ndb.Model] = [FeatureEntry, Stage, Gate]
+    for kind in kinds:
+      for entity in kind.query():
+        entity.key.delete()
+
+  def test_get_template_data__no_reviews_pending(self):
+    with test_app.app_context():
+      actual = self.handler.get_template_data()
+
+    expected_message = ('0 email(s) sent or logged.')
+    expected = {'message': expected_message}
+    self.assertEqual(actual, expected)
+
+  @mock.patch('internals.slo.remaining_days')
+  def test_get_template_data__no_reviews_due(self, mock_remaining_days):
+    self.gate_1.state = Vote.REVIEW_REQUESTED
+    self.gate_1.put()
+    mock_remaining_days.return_value = 1
+
+    with test_app.app_context():
+      actual = self.handler.get_template_data()
+
+    expected_message = '0 email(s) sent or logged.'
+    expected = {'message': expected_message}
+    self.assertEqual(actual, expected)
+
+  @mock.patch('internals.slo.remaining_days')
+  def test_get_template_data__one_due_unassigned(self, mock_remaining_days):
+    self.gate_1.state = Vote.REVIEW_REQUESTED
+    self.gate_1.requested_on = self.request_date
+    self.gate_1.put()
+    mock_remaining_days.return_value = -1
+
+    with test_app.app_context():
+      actual = self.handler.get_template_data()
+
+    expected_message = (f'4 email(s) sent or logged.\n'
+                        'Recipients:\n'
+                        'angelaweber@google.com\n'
+                        'davidayad@google.com\n'
+                        'mhoste@google.com\n'
+                        'omole@google.com')
+    expected = {'message': expected_message}
+    self.assertEqual(actual, expected)
+
+  @mock.patch('internals.slo.remaining_days')
+  def test_get_template_data__one_due_assigned(self, mock_remaining_days):
+    self.gate_1.state = Vote.REVIEW_REQUESTED
+    self.gate_1.assignee_emails = [
+        'b_assignee@example.com', 'a_assignee@example.com']
+    self.gate_1.requested_on = self.request_date
+    self.gate_1.put()
+    mock_remaining_days.return_value = -1
+
+    with test_app.app_context():
+      actual = self.handler.get_template_data()
+
+    expected_message = (f'2 email(s) sent or logged.\n'
+                        'Recipients:\n'
+                        'a_assignee@example.com\n'
+                        'b_assignee@example.com')
+    expected = {'message': expected_message}
+    self.assertEqual(actual, expected)
+
+  @mock.patch('internals.slo.remaining_days')
+  def test_get_template_data__one_overdue_unassigned(self, mock_remaining_days):
+    self.gate_1.state = Vote.REVIEW_REQUESTED
+    self.gate_1.requested_on = self.request_date
+    self.gate_1.put()
+    mock_remaining_days.return_value = -approval_defs.DEFAULT_SLO_LIMIT
+
+    with test_app.app_context():
+      actual = self.handler.get_template_data()
+
+    expected_message = (f'4 email(s) sent or logged.\n'
+                        'Recipients:\n'
+                        'angelaweber@google.com\n'
+                        'davidayad@google.com\n'
+                        'mhoste@google.com\n'
+                        'omole@google.com')
+    expected = {'message': expected_message}
+    self.assertEqual(actual, expected)
+
+  @mock.patch('internals.slo.remaining_days')
+  def test_get_template_data__one_overdue_assigned(self, mock_remaining_days):
+    self.gate_1.state = Vote.REVIEW_REQUESTED
+    self.gate_1.assignee_emails = [
+        'mhoste@google.com', 'a_assignee@example.com']
+    self.gate_1.requested_on = self.request_date
+    self.gate_1.put()
+    mock_remaining_days.return_value = -approval_defs.DEFAULT_SLO_LIMIT
+
+    with test_app.app_context():
+      actual = self.handler.get_template_data()
+
+    expected_message = (f'5 email(s) sent or logged.\n'
+                        'Recipients:\n'
+                        'a_assignee@example.com\n'
+                        'angelaweber@google.com\n'
+                        'davidayad@google.com\n'
+                        'mhoste@google.com\n'
+                        'omole@google.com')
+    expected = {'message': expected_message}
+    self.assertEqual(actual, expected)
+
+  @mock.patch('internals.slo.remaining_days')
+  def test_get_template_data__old_reviews(self, mock_remaining_days):
+    self.gate_1.state = Vote.REVIEW_REQUESTED
+    self.gate_1.put()
+    mock_remaining_days.return_value = 99
+
+    with test_app.app_context():
+      actual = self.handler.get_template_data()
+
+    expected_message = '0 email(s) sent or logged.'
+    expected = {'message': expected_message}
+    self.assertEqual(actual, expected)

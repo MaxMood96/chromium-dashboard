@@ -13,16 +13,15 @@
 # limitations under the License.
 
 import collections
-import json
 import testing_config  # Must be imported before the module under test.
-from datetime import datetime
+from datetime import date, datetime
 
 import flask
 from unittest import mock
 import werkzeug.exceptions  # Flask HTTP stuff.
 from google.cloud import ndb  # type: ignore
 
-from framework import users
+from api import converters
 
 from internals import approval_defs
 from internals import core_enums
@@ -31,6 +30,7 @@ from internals import stage_helpers
 from internals.user_models import (
     AppUser, BlinkComponent, FeatureOwner, UserPref)
 from internals.core_models import FeatureEntry, MilestoneSet, Stage
+from internals.review_models import Gate, Vote
 import settings
 
 test_app = flask.Flask(__name__,
@@ -38,6 +38,7 @@ test_app = flask.Flask(__name__,
 
 # Load testdata to be used across all of the CustomTestCases
 TESTDATA = testing_config.Testdata(__file__)
+
 
 class EmailFormattingTest(testing_config.CustomTestCase):
 
@@ -115,16 +116,66 @@ class EmailFormattingTest(testing_config.CustomTestCase):
     self.maxDiff = None
 
   def tearDown(self):
-    kinds = [FeatureEntry, Stage, FeatureOwner, BlinkComponent]
+    kinds = [FeatureEntry, Stage, FeatureOwner, BlinkComponent, Gate]
     for kind in kinds:
       for entity in kind.query():
         entity.key.delete()
+
+  def test_highlight_diff__simple(self):
+    """It produces a simple diff for adding and removing words."""
+    old = 'start remove middle end'
+    new = 'start middle add end'
+
+    actual_high_old = notifier.highlight_diff(old, new, 'deletion')
+    actual_high_new = notifier.highlight_diff(old, new, 'addition')
+
+    self.assertEqual(
+        ('start'
+         '<span style="background:#FDD"> </span>'
+         '<span style="background:#FDD">remove</span> '
+         'middle '
+         'end'
+         ),
+        actual_high_old);
+    self.assertEqual(
+        ('start '
+         'middle '
+         '<span style="background:#DFD">add</span>'
+         '<span style="background:#DFD"> </span>'
+         'end'
+         ),
+        actual_high_new);
+
+  def test_highlight_diff__escapes(self):
+    """Characters are HTML-escaped in old and new values."""
+    old = '< & " \''
+    new = '\' " & <'
+
+    actual_high_old = notifier.highlight_diff(old, new, 'deletion')
+    actual_high_new = notifier.highlight_diff(old, new, 'addition')
+
+    self.assertEqual(
+        ('<span style="background:#FDD">&lt;</span> '
+         '&amp; '
+         '<span style="background:#FDD">&#34;</span>'
+         '<span style="background:#FDD"> </span>'
+         '<span style="background:#FDD">&#39;</span>'
+         ),
+        actual_high_old);
+    self.assertEqual(
+        ('<span style="background:#DFD">&#39;</span>'
+         '<span style="background:#DFD"> </span>'
+         '<span style="background:#DFD">&#34;</span> '
+         '&amp; '
+         '<span style="background:#DFD">&lt;</span>'
+         ),
+        actual_high_new);
 
   def test_format_email_body__new(self):
     """We generate an email body for new features."""
     with test_app.app_context():
       body_html = notifier.format_email_body(
-          False, self.template_fe, [])
+          'new-feature-email.html', self.template_fe, [])
     # TESTDATA.make_golden(body_html, 'test_format_email_body__new.html')
     self.assertEqual(body_html,
       TESTDATA['test_format_email_body__new.html'])
@@ -133,7 +184,7 @@ class EmailFormattingTest(testing_config.CustomTestCase):
     """We don't crash if the change list is emtpy."""
     with test_app.app_context():
       body_html = notifier.format_email_body(
-          True, self.template_fe, [])
+          'update-feature-email.html', self.template_fe, [])
     # TESTDATA.make_golden(body_html, 'test_format_email_body__update_no_changes.html')
     self.assertEqual(body_html,
       TESTDATA['test_format_email_body__update_no_changes.html'])
@@ -142,29 +193,10 @@ class EmailFormattingTest(testing_config.CustomTestCase):
     """We generate an email body for an updated feature."""
     with test_app.app_context():
       body_html = notifier.format_email_body(
-          True, self.template_fe, self.changes)
+          'update-feature-email.html', self.template_fe, self.changes)
     # TESTDATA.make_golden(body_html, 'test_format_email_body__update_with_changes.html')
     self.assertEqual(body_html,
       TESTDATA['test_format_email_body__update_with_changes.html'])
-
-  def test_format_email_body__mozdev_links(self):
-    """We generate an email body with links to developer.mozilla.org."""
-    self.fe_1.doc_links = ['https://developer.mozilla.org/look-here']
-    with test_app.app_context():
-      body_html = notifier.format_email_body(
-          True, self.template_fe, self.changes)
-    # TESTDATA.make_golden(body_html, 'test_format_email_body__mozdev_links_mozilla.html')
-    self.assertEqual(body_html,
-      TESTDATA['test_format_email_body__mozdev_links_mozilla.html'])
-
-    self.fe_1.doc_links = [
-        'https://hacker-site.org/developer.mozilla.org/look-here']
-    with test_app.app_context():
-      body_html = notifier.format_email_body(
-          True, self.template_fe, self.changes)
-    # TESTDATA.make_golden(body_html, 'test_format_email_body__mozdev_links_non_mozilla.html')
-    self.assertEqual(body_html,
-      TESTDATA['test_format_email_body__mozdev_links_non_mozilla.html'])
 
   def test_accumulate_reasons(self):
     """We can accumulate lists of reasons why we sent a message to a user."""
@@ -230,6 +262,18 @@ class EmailFormattingTest(testing_config.CustomTestCase):
     self.assertEqual('user@chromium.org', actual['to'])
     self.assertEqual('subject', actual['subject'])
     self.assertEqual('triggerer@example.com', actual['reply_to'])
+
+  def test_apply_subscription_rules__iwa_match(self):
+    """When a feature has category IWA rule, a reason is returned."""
+    self.fe_1.category = core_enums.IWA
+    changes = [{'prop_name': 'shipped_android_milestone'}]  # Anything
+
+    actual = notifier.apply_subscription_rules(
+        self.fe_1, changes)
+
+    self.assertEqual(
+        {notifier.IWA_RULE_REASON: notifier.IWA_RULE_ADDRS},
+        actual)
 
   def test_apply_subscription_rules__relevant_match(self):
     """When a feature and change match a rule, a reason is returned."""
@@ -325,7 +369,8 @@ class EmailFormattingTest(testing_config.CustomTestCase):
     self.assertEqual('watcher_1@example.com', watcher_task['to'])
 
     mock_f_e_b.assert_called_once_with(
-        False, self.fe_1, [])
+        'new-feature-email.html', self.fe_1, [],
+        updater_email='creator1@gmail.com')
 
   @mock.patch('internals.notifier.format_email_body')
   def test_make_feature_changes_email__update(self, mock_f_e_b):
@@ -386,98 +431,8 @@ class EmailFormattingTest(testing_config.CustomTestCase):
     self.assertEqual('watcher_1@example.com', watcher_task['to'])
 
     mock_f_e_b.assert_called_once_with(
-        True, self.fe_1, self.changes)
-
-  @mock.patch('internals.notifier.format_email_body')
-  @mock.patch('internals.approval_defs.get_approvers')
-  def test_make_review_requests_email(self, mock_get_approvers, mock_f_e_b):
-    """We send email to approvers for a review request."""
-    mock_f_e_b.return_value = 'mock body html'
-    mock_get_approvers.return_value = ['approver1@example.com', 'approver2@example.com']
-
-    actual_tasks = notifier.make_review_requests_email(
-        self.fe_1, 1, self.changes)
-    self.assertEqual(2, len(actual_tasks))
-    review_task_1 = actual_tasks[0]
-
-    # Notification to feature change watcher.
-    self.assertEqual('Review Request for feature: feature one', review_task_1['subject'])
-    self.assertIn('mock body html', review_task_1['html'])
-    self.assertIn('<li>You received a review request for this feature</li>',
-      review_task_1['html'])
-    self.assertEqual('approver1@example.com', review_task_1['to'])
-
-    review_task_2 = actual_tasks[1]
-
-    # Notification to feature change watcher.
-    self.assertEqual('Review Request for feature: feature one', review_task_2['subject'])
-    self.assertIn('mock body html', review_task_2['html'])
-    self.assertIn('<li>You received a review request for this feature</li>',
-      review_task_2['html'])
-    self.assertEqual('approver2@example.com', review_task_2['to'])
-
-    mock_f_e_b.assert_called_once_with(
-        True, self.fe_1, self.changes)
-    mock_get_approvers.assert_called_once_with(1)
-
-  @mock.patch('internals.notifier.format_email_body')
-  @mock.patch('internals.approval_defs.get_approvers')
-  def test_make_new_comments_email(self, mock_get_approvers, mock_f_e_b):
-    """We send email to approvers for a review request."""
-    mock_f_e_b.return_value = 'mock body html'
-    mock_get_approvers.return_value = ['approver1@example.com']
-
-    actual_tasks = notifier.make_new_comments_email(
-        self.fe_1, 1, self.changes)
-    self.assertEqual(6, len(actual_tasks))
-    (review_task_1, feature_cc_task, devrel_task,
-     feature_editor_task, feature_owner_task, feature_editor_task_2) = actual_tasks
-
-    self.assertEqual('New comments for feature: feature one', review_task_1['subject'])
-    self.assertIn('mock body html', review_task_1['html'])
-    self.assertIn('<li>You are the reviewer for this gate</li>',
-      review_task_1['html'])
-    self.assertEqual('approver1@example.com', review_task_1['to'])
-
-    # Notification to feature owner.
-    self.assertEqual('feature_owner@example.com', feature_owner_task['to'])
-    self.assertEqual('New comments for feature: feature one',
-      feature_owner_task['subject'])
-    self.assertIn('mock body html', feature_owner_task['html'])
-    self.assertIn('<li>You are listed as an owner of this feature</li>',
-      feature_owner_task['html'])
-
-    # Notification to feature editor.
-    self.assertEqual('New comments for feature: feature one',
-      feature_editor_task['subject'])
-    self.assertIn('mock body html', feature_editor_task['html'])
-    self.assertIn('<li>You are listed as an editor of this feature</li>',
-      feature_editor_task['html'])
-    self.assertEqual('feature_editor@example.com', feature_editor_task['to'])
-
-    # Notification to devrel to feature changes.
-    self.assertEqual('New comments for feature: feature one', devrel_task['subject'])
-    self.assertIn('mock body html', devrel_task['html'])
-    self.assertIn('<li>You are a devrel contact for this feature.</li>',
-      devrel_task['html'])
-    self.assertEqual('devrel1@gmail.com', devrel_task['to'])
-
-    # Notification to user CC'd on feature changes.
-    self.assertEqual('New comments for feature: feature one',
-      feature_cc_task['subject'])
-    self.assertIn('mock body html', feature_cc_task['html'])
-    self.assertIn('<li>You are CC\'d on this feature</li>',
-      feature_cc_task['html'])
-    self.assertEqual('cc@example.com', feature_cc_task['to'])
-
-    self.assertEqual('New comments for feature: feature one', feature_editor_task_2['subject'])
-    self.assertIn('mock body html', feature_editor_task_2['html'])
-    self.assertIn('<li>You are listed as an editor of this feature</li>',
-      feature_editor_task_2['html'])
-    self.assertEqual('owner_1@example.com', feature_editor_task_2['to'])
-
-    mock_f_e_b.assert_called_once_with(True, self.fe_1, self.changes)
-    mock_get_approvers.assert_called_once_with(1)
+        'update-feature-email.html', self.fe_1, self.changes,
+        updater_email='editor1@gmail.com')
 
   @mock.patch('internals.notifier.format_email_body')
   def test_make_feature_changes_email__starrer(self, mock_f_e_b):
@@ -547,7 +502,8 @@ class EmailFormattingTest(testing_config.CustomTestCase):
     self.assertEqual('watcher_1@example.com', watcher_task['to'])
 
     mock_f_e_b.assert_called_once_with(
-        True, self.fe_1, self.changes)
+        'update-feature-email.html', self.fe_1, self.changes,
+        updater_email='editor1@gmail.com')
 
 
   @mock.patch('internals.notifier.format_email_body')
@@ -571,7 +527,288 @@ class EmailFormattingTest(testing_config.CustomTestCase):
     self.assertEqual('owner_1@example.com', component_owner_task['to'])
     self.assertEqual('watcher_1@example.com', watcher_task['to'])
     mock_f_e_b.assert_called_once_with(
-        True, self.fe_2, self.changes)
+        'update-feature-email.html', self.fe_2, self.changes,
+        updater_email='editor2@example.com')
+
+
+class FeatureCommentHandlerTest(testing_config.CustomTestCase):
+
+  def setUp(self):
+    self.fe_1 = FeatureEntry(
+        name='feature one', summary='sum',
+        owner_emails=['feature_owner@example.com'],
+        editor_emails=['feature_editor@example.com', 'owner_1@example.com'],
+        cc_emails=['cc@example.com'], category=1,
+        devrel_emails=['devrel1@gmail.com'],
+        creator_email='creator1@gmail.com',
+        updater_email='editor1@gmail.com',
+        blink_components=['Blink'],
+        ff_views=1, safari_views=1,
+        web_dev_views=1, standard_maturity=1)
+    self.fe_1.put()
+
+    self.handler = notifier.FeatureCommentHandler()
+    self.additional_template_data = {
+        'gate_url': 'fake gate url',
+        'triggering_user_email': 'commenter@example.com',
+        'content': 'fake content',
+        }
+
+
+  def tearDown(self):
+    kinds = [FeatureEntry, Stage, FeatureOwner, BlinkComponent, Gate]
+    for kind in kinds:
+      for entity in kind.query():
+        entity.key.delete()
+
+  @mock.patch('internals.notifier.format_email_body')
+  @mock.patch('internals.approval_defs.get_approvers')
+  def test_make_new_comments_email__unassigned(
+      self, mock_get_approvers, mock_f_e_b):
+    """We notify feature participants of comments."""
+    mock_f_e_b.return_value = 'mock body html'
+    mock_get_approvers.return_value = ['approver1@example.com']
+
+    actual_tasks = self.handler.make_new_comments_email(
+        self.fe_1, 1, 'commenter@example.com', self.additional_template_data)
+    self.assertEqual(6, len(actual_tasks))
+    (review_task_1, feature_cc_task, devrel_task,
+     feature_editor_task, feature_owner_task, feature_editor_task_2) = actual_tasks
+
+    self.assertEqual('New comments for feature: feature one', review_task_1['subject'])
+    self.assertIn('mock body html', review_task_1['html'])
+    self.assertIn('<li>You are a reviewer for this type of gate</li>',
+      review_task_1['html'])
+    self.assertEqual('approver1@example.com', review_task_1['to'])
+
+    # Notification to feature owner.
+    self.assertEqual('feature_owner@example.com', feature_owner_task['to'])
+    self.assertEqual('New comments for feature: feature one',
+      feature_owner_task['subject'])
+    self.assertIn('mock body html', feature_owner_task['html'])
+    self.assertIn('<li>You are listed as an owner of this feature</li>',
+      feature_owner_task['html'])
+
+    # Notification to feature editor.
+    self.assertEqual('New comments for feature: feature one',
+      feature_editor_task['subject'])
+    self.assertIn('mock body html', feature_editor_task['html'])
+    self.assertIn('<li>You are listed as an editor of this feature</li>',
+      feature_editor_task['html'])
+    self.assertEqual('feature_editor@example.com', feature_editor_task['to'])
+
+    # Notification to devrel to feature changes.
+    self.assertEqual('New comments for feature: feature one', devrel_task['subject'])
+    self.assertIn('mock body html', devrel_task['html'])
+    self.assertIn('<li>You are a devrel contact for this feature.</li>',
+      devrel_task['html'])
+    self.assertEqual('devrel1@gmail.com', devrel_task['to'])
+
+    # Notification to user CC'd on feature changes.
+    self.assertEqual('New comments for feature: feature one',
+      feature_cc_task['subject'])
+    self.assertIn('mock body html', feature_cc_task['html'])
+    self.assertIn('<li>You are CC\'d on this feature</li>',
+      feature_cc_task['html'])
+    self.assertEqual('cc@example.com', feature_cc_task['to'])
+
+    self.assertEqual('New comments for feature: feature one', feature_editor_task_2['subject'])
+    self.assertIn('mock body html', feature_editor_task_2['html'])
+    self.assertIn('<li>You are listed as an editor of this feature</li>',
+      feature_editor_task_2['html'])
+    self.assertEqual('owner_1@example.com', feature_editor_task_2['to'])
+
+    mock_f_e_b.assert_called_once_with(
+        self.handler.EMAIL_TEMPLATE_PATH, self.fe_1, [],
+        additional_template_data=self.additional_template_data)
+    mock_get_approvers.assert_called_once_with(1)
+
+  @mock.patch('internals.notifier.format_email_body')
+  def test_make_new_comments_email__assigned(self, mock_f_e_b):
+    """We notify only assigned reviewers of new comments, not all reviewers."""
+    mock_f_e_b.return_value = 'mock body html'
+    gate_1 = Gate(
+        feature_id=self.fe_1.key.integer_id(), gate_type=1,
+        stage_id=123, state=0, assignee_emails=['approver3@example.com'])
+    gate_1.put()
+
+    actual_tasks = self.handler.make_new_comments_email(
+        self.fe_1, 1, 'commenter@example.com', self.additional_template_data)
+    self.assertEqual(6, len(actual_tasks))
+    review_task_1 = actual_tasks[0]
+
+    self.assertEqual('New comments for feature: feature one', review_task_1['subject'])
+    self.assertIn('mock body html', review_task_1['html'])
+    self.assertIn('<li>This review is assigned to you</li>',
+      review_task_1['html'])
+    self.assertEqual('approver3@example.com', review_task_1['to'])
+
+
+class FeatureReviewHandlerTest(testing_config.CustomTestCase):
+
+  def setUp(self):
+    self.fe_1 = FeatureEntry(
+        name='feature one', summary='sum',
+        owner_emails=['feature_owner@example.com'],
+        editor_emails=['feature_editor@example.com', 'owner_1@example.com'],
+        cc_emails=['cc@example.com'], category=1,
+        devrel_emails=['devrel1@gmail.com'],
+        creator_email='creator1@gmail.com',
+        updater_email='editor1@gmail.com',
+        blink_components=['Blink'],
+        ff_views=1, safari_views=1,
+        web_dev_views=1, standard_maturity=1)
+    self.fe_1.put()
+
+    self.changes = [{
+        'prop_name': 'Review status change in gate_url',
+        'new_val': 'Review requested',
+        'old_val': 'na',
+    }]
+    self.handler = notifier.FeatureReviewHandler()
+
+  def tearDown(self):
+    kinds = [FeatureEntry, Stage, FeatureOwner, BlinkComponent, Gate]
+    for kind in kinds:
+      for entity in kind.query():
+        entity.key.delete()
+
+  @mock.patch('internals.notifier.format_email_body')
+  @mock.patch('internals.approval_defs.get_approvers')
+  def test_make_review_requests_email__unassigned(
+      self, mock_get_approvers, mock_f_e_b):
+    """We send email to approvers for a review request."""
+    mock_f_e_b.return_value = 'mock body html'
+    mock_get_approvers.return_value = ['approver1@example.com', 'approver2@example.com']
+
+    addl_data = {
+        'gate_url': 'gate_url',
+        'new_val': 'Review requested',
+        'updater_email': None,
+        'team_name': None,
+        }
+    actual_tasks = self.handler.make_review_requests_email(
+        self.fe_1, 1, addl_data)
+    self.assertEqual(2, len(actual_tasks))
+    review_task_1 = actual_tasks[0]
+
+    # Notification to feature change watcher.
+    self.assertEqual('Review Request for feature: feature one', review_task_1['subject'])
+    self.assertIn('mock body html', review_task_1['html'])
+    self.assertIn('<li>You are a reviewer for this type of gate</li>',
+      review_task_1['html'])
+    self.assertEqual('approver1@example.com', review_task_1['to'])
+
+    review_task_2 = actual_tasks[1]
+
+    # Notification to feature change watcher.
+    self.assertEqual('Review Request for feature: feature one', review_task_2['subject'])
+    self.assertIn('mock body html', review_task_2['html'])
+    self.assertIn('<li>You are a reviewer for this type of gate</li>',
+      review_task_2['html'])
+    self.assertEqual('approver2@example.com', review_task_2['to'])
+
+    mock_f_e_b.assert_called_once_with(
+        'review-request-email.html', self.fe_1, [],
+        additional_template_data=addl_data)
+    mock_get_approvers.assert_called_once_with(1)
+
+  @mock.patch('internals.notifier.format_email_body')
+  def test_make_review_requests_email__assigned(self, mock_f_e_b):
+    """We send email to the assigned reviewer for a review request."""
+    mock_f_e_b.return_value = 'mock body html'
+    gate_1 = Gate(
+        feature_id=self.fe_1.key.integer_id(), gate_type=1,
+        stage_id=123, state=0, assignee_emails=['approver3@example.com'])
+    gate_1.put()
+
+    addl_data = {
+        'gate_url': 'gate_url',
+        'new_val': 'Review requested',
+        'updater_email': None,
+        'team_name': None,
+        }
+    actual_tasks = self.handler.make_review_requests_email(
+        self.fe_1, 1, addl_data)
+    self.assertEqual(1, len(actual_tasks))
+    review_task_1 = actual_tasks[0]
+
+    # Notification to feature change watcher.
+    self.assertEqual('Review Request for feature: feature one', review_task_1['subject'])
+    self.assertIn('mock body html', review_task_1['html'])
+    self.assertIn('<li>This review is assigned to you</li>',
+      review_task_1['html'])
+    self.assertEqual('approver3@example.com', review_task_1['to'])
+
+
+class ReviewAssignementHandlerTest(testing_config.CustomTestCase):
+
+  def setUp(self):
+    self.fe_1 = FeatureEntry(
+        name='feature one', summary='sum',
+        owner_emails=['feature_owner@example.com'],
+        editor_emails=['feature_editor@example.com', 'owner_1@example.com'],
+        cc_emails=['cc@example.com'], category=1,
+        devrel_emails=['devrel1@gmail.com'],
+        creator_email='creator1@gmail.com',
+        updater_email='editor1@gmail.com',
+        blink_components=['Blink'],
+        ff_views=1, safari_views=1,
+        web_dev_views=1, standard_maturity=1)
+    self.fe_1.put()
+
+    self.handler = notifier.ReviewAssignmentHandler()
+
+  def tearDown(self):
+    kinds = [FeatureEntry, Stage, FeatureOwner, BlinkComponent, Gate]
+    for kind in kinds:
+      for entity in kind.query():
+        entity.key.delete()
+
+  @mock.patch('internals.notifier.format_email_body')
+  def test_make_review_assignment_email(self, mock_f_e_b):
+    """We send email to the assigned reviewers."""
+    mock_f_e_b.return_value = 'mock body html'
+
+    addl_data = {
+        'gate_url': 'gate_url',
+        'updater_email': None,
+        'team_name': None,
+        }
+    actual_tasks = self.handler.make_review_assignment_email(
+        self.fe_1, 'triggerer@example.com',
+        ['old@example.com'],['new@example.com'], addl_data)
+    self.assertEqual(2, len(actual_tasks))
+    review_task_1 = actual_tasks[0]
+
+    # Notification to new assignee.
+    self.assertEqual(
+        'Review assigned for feature: feature one',
+        review_task_1['subject'])
+    self.assertIn('mock body html', review_task_1['html'])
+    self.assertIn('<li>The review is now assigned to you</li>',
+      review_task_1['html'])
+    self.assertEqual('new@example.com', review_task_1['to'])
+
+    review_task_2 = actual_tasks[1]
+
+    # Notification to old assignee.
+    self.assertEqual(
+        'Review assigned for feature: feature one',
+        review_task_2['subject'])
+    self.assertIn('mock body html', review_task_2['html'])
+    self.assertIn('<li>The review was previously assigned to you</li>',
+      review_task_2['html'])
+    self.assertEqual('old@example.com', review_task_2['to'])
+
+    change = {
+        'prop_name': 'Assigned reviewer',
+        'old_val': 'old@example.com',
+        'new_val': 'new@example.com',
+        }
+    mock_f_e_b.assert_called_once_with(
+        'review-assigned-email.html', self.fe_1, [change],
+        additional_template_data=addl_data)
 
 
 class FeatureStarTest(testing_config.CustomTestCase):
@@ -686,7 +923,7 @@ class NotifyInactiveUsersHandlerTest(testing_config.CustomTestCase):
       last_visit=datetime(2023, 2, 20))
     inactive_user.put()
     self.inactive_user = inactive_user
-    
+
     # User who has recently been given access by an admin,
     # but has not yet visited the site. They should not be considered inactive.
     newly_created_user = AppUser(
@@ -740,6 +977,499 @@ class NotifyInactiveUsersHandlerTest(testing_config.CustomTestCase):
     self.assertEqual(result.get('message', None), expected)
     # The inactive user who was notified should be flagged as notified.
     self.assertTrue(self.inactive_user.notified_inactive)
+
+
+class OTCreationRequestHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.feature = FeatureEntry(
+        id=1, name='A feature', summary='summary', category=1)
+    self.ot_stage = Stage(
+      feature_id=1,
+      stage_type=150,
+      intent_thread_url='https://example.com/intent',
+      ot_chromium_trial_name='ChromiumTrialName',
+      ot_description='A brief description.',
+      ot_display_name='A new origin trial',
+      ot_documentation_url='https://example.com/docs',
+      ot_feedback_submission_url='https://example.com/feedback',
+      ot_has_third_party_support=True,
+      ot_is_deprecation_trial=True,
+      ot_is_critical_trial=False,
+      ot_owner_email='owner@example.com',
+      ot_emails=['user1@example.com', 'user2@example.com'],
+      ot_webfeature_use_counter='kWebFeature',
+      ot_request_note='Additional information about the trial creation.',
+      milestones=MilestoneSet(
+        desktop_first=100,
+        desktop_last=200,
+      ),
+    )
+    self.feature.put()
+    self.ot_stage.put()
+
+  def tearDown(self) -> None:
+    kinds: list[ndb.Model] = [FeatureEntry, Stage]
+    for kind in kinds:
+      for entity in kind.query():
+        entity.key.delete()
+
+  def test_make_creation_request_email(self):
+    stage_dict = converters.stage_to_json_dict(self.ot_stage)
+    stage_dict['ot_request_note'] = self.ot_stage.ot_request_note
+    handler = notifier.OTCreationRequestHandler()
+    email_task = handler.make_creation_request_email(stage_dict)
+
+    expected_body = """
+<p>
+  Requested by: owner@example.com
+  <br>
+  Additional contacts for your team?: user1@example.com,user2@example.com
+  <br>
+  Feature name: A new origin trial
+  <br>
+  Feature description: A brief description.
+  <br>
+  Start Chrome milestone: 100
+  <br>
+  End Chrome milestone: 200
+  <br>
+  Chromium trial name: ChromiumTrialName
+  <br>
+  Is this a deprecation trial?: Yes
+  <br>
+  Third party origin support: Yes
+  <br>
+  WebFeature UseCounter value: kWebFeature
+  <br>
+  Documentation link: https://example.com/docs
+  <br>
+  Chromestatus link: https://chromestatus.com/feature/1
+  <br>
+  Feature feedback link: https://example.com/feedback
+  <br>
+  Intent to Experiment link: https://example.com/intent
+  <br>
+  Is this a critical trial?: No
+  <br>
+  Anything else?: Additional information about the trial creation.
+  <br>
+  <br>
+  Instructions for handling this request can be found at: https://g3doc.corp.google.com/chrome/origin_trials/g3doc/trial_admin.md?cl=head#setup-a-new-trial
+</p>
+"""
+    expected = {
+      'to': 'origin-trials-support@google.com',
+      'subject': 'New Trial Creation Request for A new origin trial',
+      'reply_to': None,
+      'html': expected_body,
+    }
+
+    self.assertEqual(email_task, expected)
+
+
+class OTExtendedHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.feature = FeatureEntry(
+        id=1, name='A feature', summary='summary', category=1)
+    self.ot_stage = Stage(
+      id=2,
+      feature_id=1,
+      stage_type=150,
+      intent_thread_url='https://example.com/intent',
+      ot_chromium_trial_name='ChromiumTrialName',
+      ot_description='A brief description.',
+      ot_display_name='An existing origin trial',
+      ot_documentation_url='https://example.com/docs',
+      ot_feedback_submission_url='https://example.com/feedback',
+      ot_has_third_party_support=True,
+      ot_is_deprecation_trial=True,
+      ot_is_critical_trial=False,
+      ot_owner_email='owner@example.com',
+      ot_emails=['user1@example.com', 'user2@example.com'],
+      ot_webfeature_use_counter='kWebFeature',
+      ot_request_note='Additional information about the trial creation.',
+      milestones=MilestoneSet(
+        desktop_first=100,
+        desktop_last=103,
+      ),
+    )
+    self.extension_stage = Stage(
+      feature_id=1, ot_stage_id=2, stage_type=151,
+      milestones=MilestoneSet(desktop_last=106),
+      ot_owner_email='user2@example.com',
+      intent_thread_url='https://example.com/intent'
+    )
+    self.feature.put()
+    self.ot_stage.put()
+    self.extension_stage.put()
+
+  def tearDown(self) -> None:
+    kinds: list[ndb.Model] = [FeatureEntry, Stage]
+    for kind in kinds:
+      for entity in kind.query():
+        entity.key.delete()
+
+  def test_make_extended_request_email(self):
+    ot_stage_dict = converters.stage_to_json_dict(self.ot_stage)
+    extension_stage_dict = converters.stage_to_json_dict(self.extension_stage)
+    with test_app.app_context():
+      handler = notifier.OTExtendedHandler()
+      email_task = handler.build_email(extension_stage_dict, ot_stage_dict)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_extended_request_email.html')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_extended_request_email.html'])
+
+
+class OTExtensionApprovedHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.feature = FeatureEntry(
+        id=1, name='A feature', summary='summary', category=1)
+    self.ot_stage = Stage(id=2, feature_id=1, stage_type=150)
+    self.extension_stage = Stage(
+      feature_id=1, ot_stage_id=2, stage_type=151,
+      milestones=MilestoneSet(desktop_last=106),
+      ot_owner_email='user2@example.com',
+      intent_thread_url='https://example.com/intent',
+    )
+    self.extension_gate = Gate(
+        id=3, feature_id=1, stage_id=2, gate_type=3, state=Vote.APPROVED)
+    self.extension_gate.put()
+    self.feature.put()
+    self.ot_stage.put()
+    self.extension_stage.put()
+
+  def tearDown(self) -> None:
+    kinds: list[ndb.Model] = [FeatureEntry, Gate, Stage]
+    for kind in kinds:
+      for entity in kind.query():
+        entity.key.delete()
+
+  def test_make_extension_approved_email(self):
+    feature_dict = converters.feature_entry_to_json_verbose(self.feature)
+    with test_app.app_context():
+      handler = notifier.OTExtensionApprovedHandler()
+      email_task = handler.build_email(feature_dict,
+                                       self.extension_stage.ot_owner_email,
+                                       self.extension_gate.key.integer_id())
+      # TESTDATA.make_golden(email_task['html'], 'test_make_extension_approved_email.html')
+      self.assertEqual(
+          email_task['subject'],
+          ('Origin trial extension approved and ready to be initiated: '
+           'A feature'))
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_extension_approved_email.html'])
+
+
+class OTActivatedHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.contacts = [
+        'ot_owner1@google.com',
+        'contact1@google.com',
+        'contact2@example.com']
+    self.feature_1 = FeatureEntry(
+        id=1, name='feature one', summary='sum', category=1, feature_type=0)
+    self.feature_1.put()
+    self.ot_stage = Stage(
+        feature_id=1, stage_type=150, ot_display_name='Example Trial',
+        origin_trial_id='111222333',
+        ot_owner_email='feature_owner@google.com',
+        ot_chromium_trial_name='ExampleTrial',
+        milestones=MilestoneSet(desktop_first=100, desktop_last=106),
+        ot_documentation_url='https://example.com/docs',
+        ot_feedback_submission_url='https://example.com/feedback',
+        intent_thread_url='https://example.com/experiment',
+        ot_description='OT description', ot_has_third_party_support=True,
+        ot_is_deprecation_trial=True)
+    self.ot_stage.put()
+
+  def tearDown(self):
+    self.feature_1.key.delete()
+    self.ot_stage.key.delete()
+
+  def test_make_activated_email(self):
+    with test_app.app_context():
+      handler = notifier.OTActivatedHandler()
+      stage_dict = converters.stage_to_json_dict(self.ot_stage)
+      email_task = handler.build_email(stage_dict, self.contacts)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_activated_email.html')
+      self.assertEqual(email_task['subject'],
+                       'Example Trial origin trial is now available')
+      self.assertEqual(email_task['html'],
+                       TESTDATA['test_make_activated_email.html'])
+
+
+class OTCreationProcessedHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.contacts = ['owner1@example.com',
+                     'contact1@example.com',
+                     'contact2@example.com']
+    self.feature_1 = FeatureEntry(
+        id=1, name='feature one', summary='sum', category=1, feature_type=0)
+    self.feature_1.put()
+    self.ot_stage = Stage(
+        feature_id=1, stage_type=150, ot_display_name='Example Trial',
+        ot_owner_email='feature_owner@google.com',
+        ot_chromium_trial_name='ExampleTrial',
+        milestones=MilestoneSet(desktop_first=100, desktop_last=106),
+        ot_documentation_url='https://example.com/docs',
+        ot_feedback_submission_url='https://example.com/feedback',
+        intent_thread_url='https://example.com/experiment',
+        ot_description='OT description', ot_has_third_party_support=True,
+        ot_activation_date=date(2030, 1, 1),
+        ot_is_deprecation_trial=True)
+    self.ot_stage.put()
+
+  def tearDown(self):
+    self.feature_1.key.delete()
+    self.ot_stage.key.delete()
+
+  def test_make_creation_processed_email(self):
+    with test_app.app_context():
+      handler = notifier.OTCreationProcessedHandler()
+      stage_dict = converters.stage_to_json_dict(self.ot_stage)
+      email_task = handler.build_email(stage_dict, self.contacts)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_creation_processed_email.html')
+      self.assertEqual(
+        email_task['subject'],
+        'Example Trial origin trial has been created and will begin 2030-01-01')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_creation_processed_email.html'])
+
+
+class OTCreationRequestFailedHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.feature_1 = FeatureEntry(
+        id=1, name='feature one', summary='sum', category=1, feature_type=0)
+    self.feature_1.put()
+    self.ot_stage = Stage(
+        id=237, feature_id=1, stage_type=150, ot_display_name='Example Trial',
+        ot_owner_email='feature_owner@google.com',
+        ot_chromium_trial_name='ExampleTrial',
+        milestones=MilestoneSet(desktop_first=100, desktop_last=106),
+        ot_documentation_url='https://example.com/docs',
+        ot_feedback_submission_url='https://example.com/feedback',
+        intent_thread_url='https://example.com/experiment',
+        ot_description='OT description', ot_has_third_party_support=True,
+        ot_activation_date=date(2030, 1, 1),
+        ot_is_deprecation_trial=True, origin_trial_id='-1239058')
+    self.ot_stage.put()
+
+  def tearDown(self):
+    self.feature_1.key.delete()
+    self.ot_stage.key.delete()
+
+  def test_make_creation_request_failed_email(self):
+    with test_app.app_context():
+      handler = notifier.OTCreationRequestFailedHandler()
+      stage_dict = converters.stage_to_json_dict(self.ot_stage)
+      error_text = 'Something went pretty wrong'
+      email_task = handler.build_email(stage_dict, error_text)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_creation_request_failed_email.html')
+      self.assertEqual(
+        email_task['subject'],
+        'Automated trial creation request failed for Example Trial')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_creation_request_failed_email.html'])
+
+
+class OTActivationFailedHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.feature_1 = FeatureEntry(
+        id=1, name='feature one', summary='sum', category=1, feature_type=0)
+    self.feature_1.put()
+    self.ot_stage = Stage(
+        feature_id=1, stage_type=150, ot_display_name='Example Trial',
+        origin_trial_id='111222333', ot_activation_date=date(2030, 1, 1),
+        ot_owner_email='feature_owner@google.com',
+        ot_chromium_trial_name='ExampleTrial',
+        milestones=MilestoneSet(desktop_first=100, desktop_last=106),
+        ot_documentation_url='https://example.com/docs',
+        ot_feedback_submission_url='https://example.com/feedback',
+        intent_thread_url='https://example.com/experiment',
+        ot_description='OT description', ot_has_third_party_support=True,
+        ot_is_deprecation_trial=True)
+    self.ot_stage.put()
+
+  def tearDown(self):
+    self.feature_1.key.delete()
+    self.ot_stage.key.delete()
+
+  def test_make_activation_failed_email(self):
+    with test_app.app_context():
+      handler = notifier.OTActivationFailedHandler()
+      stage_dict = converters.stage_to_json_dict(self.ot_stage)
+      email_task = handler.build_email(stage_dict)
+      TESTDATA.make_golden(email_task['html'], 'test_make_activation_failed_email.html')
+      self.assertEqual(
+        email_task['subject'],
+        'Automated trial activation request failed for Example Trial')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_activation_failed_email.html'])
+
+
+class IntentToBlinkDevHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.feature_1 = FeatureEntry(
+        id=1, feature_type=1, name='feature one', summary='sum', category=1,
+        owner_emails=['owner@example.com'])
+    self.feature_1.put()
+    self.feature_1_id = self.feature_1.key.integer_id()
+    self.ot_stage_1 = Stage(
+        feature_id=self.feature_1_id, stage_type=150,
+        origin_trial_id='-1234567890')
+    self.ot_stage_1.put()
+    self.ot_gate_1 = Gate(id=100, feature_id=self.feature_1_id,
+                stage_id=self.ot_stage_1.key.integer_id(),
+                gate_type=2, state=Vote.APPROVED)
+    self.ot_gate_1.put()
+    self.contacts = ['example_user@example.com', 'another_user@exmaple.com']
+
+  def tearDown(self):
+    for kind in [FeatureEntry, Stage, Gate]:
+      for entity in kind.query():
+        entity.key.delete()
+
+  def test_make_intent_post_email(self):
+    json_data = {
+      'subject': 'Intent to Experiment: feature one',
+      'feature_id': self.feature_1_id,
+      'sections_to_show': ['i2p_thread', 'experiment', 'extension_reason'],
+      'intent_stage': 3,
+      'default_url': (f'https://chromestatus.com/feature/{self.feature_1_id}'
+                      f'?gate=${self.ot_gate_1.key.integer_id()}'),
+      'intent_cc_emails': ['cc1@example.com', 'owner@example.com'],
+    }
+    with test_app.app_context():
+      handler = notifier.IntentToBlinkDevHandler()
+      email_task = handler.build_email(self.feature_1, json_data)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_intent_email.html')
+      self.assertEqual(email_task['to'], 'blink-dev@chromium.org')
+      self.assertEqual(email_task['cc'],
+                       ['cc1@example.com', 'owner@example.com'])
+      self.assertEqual(email_task['subject'],
+                       'Intent to Experiment: feature one')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_intent_email.html'])
+
+
+class OTEndingNextReleaseReminderHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.contacts = ['example_user@example.com', 'another_user@exmaple.com']
+
+  def test_make_ending_next_release_email(self):
+    body_data = {
+      'name': 'Some feature',
+      'release_milestone': '126',
+      'after_end_release': '127',
+      'after_end_date': '2030-01-01'
+    }
+    with test_app.app_context():
+      handler = notifier.OTEndingNextReleaseReminderHandler()
+      email_task = handler.build_email(body_data, self.contacts)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_ending_next_release_email.html')
+      self.assertEqual(email_task['subject'],
+        'Some feature origin trial ship decision approaching')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_ending_next_release_email.html'])
+
+
+class OTEndingThisReleaseReminderHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.contacts = ['example_user@example.com', 'another_user@exmaple.com']
+
+  def test_make_ending_this_release_email(self):
+    body_data = {
+      'name': 'Some feature',
+      'release_milestone': '126',
+      'next_release': '127',
+    }
+    with test_app.app_context():
+      handler = notifier.OTEndingThisReleaseReminderHandler()
+      email_task = handler.build_email(body_data, self.contacts)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_ending_this_release_email.html')
+      self.assertEqual(email_task['subject'],
+        'Some feature origin trial needs blink-dev update')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_ending_this_release_email.html'])
+
+
+class OTBetaAvailabilityReminderHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.contacts = ['example_user@example.com', 'another_user@exmaple.com']
+
+  def test_make_beta_availability_email(self):
+    body_data = {
+      'name': 'Some feature',
+      'release_milestone': '126',
+    }
+    with test_app.app_context():
+      handler = notifier.OTBetaAvailabilityReminderHandler()
+      email_task = handler.build_email(body_data, self.contacts)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_beta_availability_email.html')
+      self.assertEqual(email_task['subject'],
+        'Some feature origin trial is entering beta')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_beta_availability_email.html'])
+
+
+class OTFirstBranchReminderHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.contacts = ['example_user@example.com', 'another_user@exmaple.com']
+
+  def test_make_first_branch_email(self):
+    body_data = {
+      'name': 'Some feature',
+      'release_milestone': '126',
+      'branch_date': '2030-01-01',
+    }
+    with test_app.app_context():
+      handler = notifier.OTFirstBranchReminderHandler()
+      email_task = handler.build_email(body_data, self.contacts)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_first_branch_email.html')
+      self.assertEqual(email_task['subject'],
+        'Some feature origin trial is branching')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_first_branch_email.html'])
+
+
+class OTLastBranchReminderHandlerTest(testing_config.CustomTestCase):
+  def setUp(self):
+    self.contacts = ['example_user@example.com', 'another_user@exmaple.com']
+
+  def test_make_last_branch_email(self):
+    body_data = {
+      'name': 'Some feature',
+      'release_milestone': '126',
+      'branch_date': '2030-01-01',
+    }
+    with test_app.app_context():
+      handler = notifier.OTLastBranchReminderHandler()
+      email_task = handler.build_email(body_data, self.contacts)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_last_branch_email.html')
+      self.assertEqual(email_task['subject'],
+        'Some feature origin trial has branched for its last release')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_last_branch_email.html'])
+
+
+class OTAutomatedProcessEmailHandlerTest(testing_config.CustomTestCase):
+  def test_make_ot_process_email(self):
+    body_data = {
+      'email_date': '2030-01-01',
+      'send_count': 100,
+      'next_branch_milestone': 200,
+      'next_branch_date': '2030-01-31',
+      'stable_milestone': 201,
+      'stable_date': '2030-02-01',
+    }
+    with test_app.app_context():
+      handler = notifier.OTAutomatedProcessEmailHandler()
+      email_task = handler.build_email(body_data)
+      # TESTDATA.make_golden(email_task['html'], 'test_make_ot_process_email.html')
+      self.assertEqual(email_task['subject'],
+        'Origin trials automated process reminder just ran')
+      self.assertEqual(email_task['html'],
+        TESTDATA['test_make_ot_process_email.html'])
 
 
 class FunctionsTest(testing_config.CustomTestCase):

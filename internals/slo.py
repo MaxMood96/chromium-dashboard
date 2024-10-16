@@ -22,7 +22,7 @@ from internals.core_models import FeatureEntry
 from internals.review_models import Gate, Vote
 
 PACIFIC_TZ = pytz.timezone('US/Pacific')
-MAX_DAYS = 9999
+MAX_DAYS = 30
 
 
 def is_weekday(d: datetime.datetime) -> bool:
@@ -32,6 +32,11 @@ def is_weekday(d: datetime.datetime) -> bool:
 
 def weekdays_between(start: datetime.datetime, end: datetime.datetime) -> int:
   """Return the number of Pacific timezone weekdays between two UTC dates."""
+  # If the difference is big, just approximate.
+  calendar_days = (end - start).days
+  if calendar_days > MAX_DAYS:
+    return calendar_days * 5 // 7
+
   d_ptz = start.astimezone(PACIFIC_TZ)
   # The day of the request does not count.
   d_ptz = d_ptz.replace(hour=23, minute=59, second=59)
@@ -85,7 +90,7 @@ def record_comment(
   elif gate.responded_on is not None:
     return False  # We already recorded the time of the initial response.
   else:
-    is_approver = permissions.can_approve_feature(user, feature, approvers)
+    is_approver = permissions.can_review_gate(user, feature, gate, approvers)
     if is_approver:
       logging.info('SLO: Got reviewer comment as initial response')
       gate.responded_on = now_utc()
@@ -104,7 +109,7 @@ def is_gate_overdue(gate, appr_fields, default_slo_limit) -> bool:
   return remaining_days(gate.requested_on, slo_limit) < 0
 
 
-def get_overdue_gates(appr_fields, default_slo_limit):
+def get_overdue_gates(appr_fields, default_slo_limit) -> list[Gate]:
   """Return a list of gates with overdue reviews."""
   active_gates = Gate.query(Gate.state.IN(Gate.PENDING_STATES))
   overdue_gates = [g for g in active_gates

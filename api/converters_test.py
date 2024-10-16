@@ -18,6 +18,7 @@ from unittest import mock
 from datetime import datetime
 
 from api import converters
+from internals.core_enums import *
 from internals.core_models import FeatureEntry, MilestoneSet, Stage
 from internals.review_models import Vote, Gate
 from internals import approval_defs
@@ -47,10 +48,11 @@ class FeatureConvertersTest(testing_config.CustomTestCase):
         updater_email='updater@example.com', category=1,
         owner_emails=['feature_owner@example.com'], feature_type=0,
         editor_emails=['feature_editor@example.com', 'owner_1@example.com'],
-        impl_status_chrome=5, blink_components=['Blink'],
+        impl_status_chrome=5, blink_components=['Blink'], shipping_year=2024,
         spec_link='https://example.com/spec',
         sample_links=['https://example.com/samples'],
-        screenshot_links=['https://example.com/screenshot'], standard_maturity=1,
+        screenshot_links=['https://example.com/screenshot'],
+        first_enterprise_notification_milestone=100, standard_maturity=1,
         ff_views=5, ff_views_link='https://example.com/ff_views',
         ff_views_notes='ff notes', safari_views=1,
         bug_url='https://example.com/bug',
@@ -102,6 +104,8 @@ class FeatureConvertersTest(testing_config.CustomTestCase):
       'summary': 'sum',
       'unlisted': False,
       'blink_components': ['Blink'],
+      'first_enterprise_notification_milestone': 100,
+      'enterprise_impact': ENTERPRISE_IMPACT_NONE,
       'breaking_change': False,
       'is_released': True,
       'milestone': None,
@@ -185,6 +189,8 @@ class FeatureConvertersTest(testing_config.CustomTestCase):
       'summary': 'sum',
       'unlisted': False,
       'blink_components': ['Blink'],
+      'first_enterprise_notification_milestone': 100,
+      'enterprise_impact': ENTERPRISE_IMPACT_NONE,
       'breaking_change': False,
       'is_released': True,
       'milestone': True,
@@ -286,11 +292,13 @@ class FeatureConvertersTest(testing_config.CustomTestCase):
       'summary': 'sum',
       'unlisted': False,
       'api_spec': False,
+      'enterprise_impact': ENTERPRISE_IMPACT_NONE,
+      'shipping_year': 2024,
       'breaking_change': False,
       'is_released': True,
       'category': 'Web Components',
       'category_int': 1,
-      'feature_type': 'New feature incubation',
+      'feature_type': 'New or changed feature',
       'feature_type_int': 0,
       'is_enterprise_feature': False,
       'intent_stage': 'Start prototyping',
@@ -306,6 +314,7 @@ class FeatureConvertersTest(testing_config.CustomTestCase):
       'spec_link': 'https://example.com/spec',
       'sample_links': ['https://example.com/samples'],
       'screenshot_links': ['https://example.com/screenshot'],
+      'first_enterprise_notification_milestone': 100,
       'created': {
         'by': 'creator@example.com',
         'when': str(self.date)
@@ -360,7 +369,6 @@ class FeatureConvertersTest(testing_config.CustomTestCase):
       'new_crbug_url': 'https://bugs.chromium.org/p/chromium/issues/entry?components=Blink&cc=feature_owner@example.com',
       'non_oss_deps': None,
       'ongoing_constraints': None,
-      'owner_emails': ['feature_owner@example.com'],
       'owner_emails': ['feature_owner@example.com'],
       'safari_views': 1,
       'search_tags': [],
@@ -509,10 +517,11 @@ class GateConvertersTest(testing_config.CustomTestCase):
       'gate_type': 3,
       'team_name': appr_def.team_name,
       'gate_name': appr_def.name,
+      'escalation_email': None,
       'state': 4,
       'requested_on': None,
       'responded_on': None,
-      'owners': [],
+      'assignee_emails': [],
       'next_action': None,
       'additional_review': False,
       'slo_initial_response': appr_def.slo_initial_response,
@@ -527,12 +536,12 @@ class GateConvertersTest(testing_config.CustomTestCase):
     gate = Gate(
         feature_id=1, stage_id=2, gate_type=34, state=4,
         requested_on=datetime(2022, 12, 14, 1, 2, 3), # Wednesday
-        owners=['appr1@example.com', 'appr2@example.com'],
+        assignee_emails=['appr1@example.com', 'appr2@example.com'],
         next_action=datetime(2022, 12, 25),
         additional_review=True)
     gate.put()
-    # The review weas due on Friday 2022-12-16.
-    mock_now.return_value = datetime(2022, 12, 20, 1, 2, 3)  # Tuesday after.
+    # The review was due on Wednesday 2022-12-21.
+    mock_now.return_value = datetime(2022, 12, 23, 1, 2, 3)  # Thursday after.
 
     actual = converters.gate_value_to_json_dict(gate)
     appr_def = approval_defs.APPROVAL_FIELDS_BY_ID[gate.gate_type]
@@ -543,15 +552,16 @@ class GateConvertersTest(testing_config.CustomTestCase):
       'gate_type': 34,
       'team_name': appr_def.team_name,
       'gate_name': appr_def.name,
+      'escalation_email': 'chrome-privacy-owp-rotation@google.com',
       'state': 4,
       'requested_on': '2022-12-14 01:02:03',
       'responded_on': None,
-      'owners': ['appr1@example.com', 'appr2@example.com'],
+      'assignee_emails': ['appr1@example.com', 'appr2@example.com'],
       'next_action': '2022-12-25',
       'additional_review': True,
       'slo_initial_response': appr_def.slo_initial_response,
       'slo_initial_response_took': None,  # Review is still in-progress.
-      'slo_initial_response_remaining': -2,  # Two weekdays overdue.
+      'slo_initial_response_remaining': -1,  # One weekday overdue.
       }
     self.assertEqual(expected, actual)
 
@@ -561,7 +571,7 @@ class GateConvertersTest(testing_config.CustomTestCase):
         feature_id=1, stage_id=2, gate_type=3, state=4,
         requested_on=datetime(2022, 12, 14, 1, 2, 3),
         responded_on=datetime(2022, 12, 20, 1, 2, 3),
-        owners=['appr1@example.com', 'appr2@example.com'],
+        assignee_emails=['appr1@example.com', 'appr2@example.com'],
         next_action=datetime(2022, 12, 25),
         additional_review=True)
     gate.put()

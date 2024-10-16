@@ -13,10 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import base64
-import hmac
 import logging
 import random
+import settings
 import string
 import time
 
@@ -27,6 +26,7 @@ from google.cloud import ndb  # type: ignore
 RANDOM_KEY_LENGTH = 128
 RANDOM_KEY_CHARACTERS = string.ascii_letters + string.digits
 
+ot_api_key: str|None = None
 
 def make_random_key(length=RANDOM_KEY_LENGTH, chars=RANDOM_KEY_CHARACTERS):
   """Return a string with lots of random characters."""
@@ -41,6 +41,7 @@ class Secrets(ndb.Model):
   session_secret = ndb.StringProperty()
 
   @classmethod
+  @ndb.transactional(retries=4)
   def _get_or_make_singleton(cls):
     needs_save = False
     singleton = None
@@ -121,3 +122,68 @@ class ApiCredential(ndb.Model):
     logging.info('Recording failure at %r', now or int(time.time()))
     self.failure_timestamp = now or int(time.time())
     self.put()
+
+
+def get_ot_api_key() -> str|None:
+  """Obtain an API key to be used for requests to the origin trials API."""
+  # Reuse the API key's value if we've already obtained it.
+  if settings.OT_API_KEY is not None:
+    return settings.OT_API_KEY
+
+  if settings.DEV_MODE or settings.UNIT_TEST_MODE:
+    # In dev or unit test mode, pull the API key from a local file.
+    try:
+      with open(f'{settings.ROOT_DIR}/ot_api_key.txt', 'r') as f:
+        settings.OT_API_KEY = f.read().strip()
+        return settings.OT_API_KEY
+    except:
+      logging.info('No key found locally for the Origin Trials API.')
+      return None
+  else:
+    # If in staging or prod, pull the API key from the project secrets.
+    from google.cloud.secretmanager import SecretManagerServiceClient
+    client = SecretManagerServiceClient()
+    name = (f'{client.secret_path(settings.APP_ID, "OT_API_KEY")}'
+            '/versions/latest')
+    response = client.access_secret_version(request={'name': name})
+    if response:
+      settings.OT_API_KEY = response.payload.data.decode("UTF-8")
+      return settings.OT_API_KEY
+  return None
+
+
+def get_ot_support_emails() -> str|None:
+  """Obtain a comma-separated list of the OT support members."""
+  if settings.DEV_MODE or settings.UNIT_TEST_MODE:
+    # In dev or unit test mode, return a dummy value.
+    return settings.DEV_MODE_OT_SUPPORT_EMAILS
+
+  # If in staging or prod, pull the value from the project secrets.
+  from google.cloud.secretmanager import SecretManagerServiceClient
+  client = SecretManagerServiceClient()
+  name = (f'{client.secret_path(settings.APP_ID, "OT_SUPPORT_EMAILS")}'
+          '/versions/latest')
+  response = client.access_secret_version(request={'name': name})
+  if response:
+    return response.payload.data.decode("UTF-8")
+  return None
+
+
+def get_ot_data_access_admin_group() -> str|None:
+  """Obtain the name of the data access admn group for OT."""
+  # Reuse the value if we've already obtained it.
+  if settings.OT_DATA_ACCESS_ADMIN_GROUP_NAME is not None:
+    return settings.OT_DATA_ACCESS_ADMIN_GROUP_NAME
+
+  # If in staging or prod, pull the value from the project secrets.
+  from google.cloud.secretmanager import SecretManagerServiceClient
+  client = SecretManagerServiceClient()
+  secret_path = client.secret_path(settings.APP_ID,
+                                    "OT_DATA_ACCESS_ADMIN_GROUP_NAME")
+  name = f'{secret_path}/versions/latest'
+  response = client.access_secret_version(request={'name': name})
+  if response:
+    settings.OT_DATA_ACCESS_ADMIN_GROUP_NAME = (
+        response.payload.data.decode("UTF-8"))
+    return settings.OT_DATA_ACCESS_ADMIN_GROUP_NAME
+  return None

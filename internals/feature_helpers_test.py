@@ -243,6 +243,90 @@ class FeatureHelpersTest(testing_config.CustomTestCase):
     self.assertEqual('feature c', actual[2]['name'])
     self.assertEqual('feature b', actual[3]['name'])
 
+  def test_get_feature_names_by_ids__empty(self):
+    """A request to load zero feature name returns zero results."""
+    actual = feature_helpers.get_feature_names_by_ids([])
+    self.assertEqual([], actual)
+
+  def test_get_feature_names_by_ids__cache_miss(self):
+    """We can load feature names from datastore, and cache them for later."""
+    actual = feature_helpers.get_feature_names_by_ids([
+        self.feature_1.key.integer_id(),
+        self.feature_2.key.integer_id()])
+
+    self.assertEqual(2, len(actual))
+    self.assertEqual(2, len(actual[0]))
+    self.assertEqual('feature a', actual[0]['name'])
+    self.assertEqual(2, len(actual[1]))
+    self.assertEqual('feature b', actual[1]['name'])
+
+    lookup_key_1 = '%s|%s' % (FeatureEntry.FEATURE_NAME_CACHE_KEY,
+                              self.feature_1.key.integer_id())
+    lookup_key_2 = '%s|%s' % (FeatureEntry.FEATURE_NAME_CACHE_KEY,
+                              self.feature_2.key.integer_id())
+    self.assertEqual('feature a', rediscache.get(lookup_key_1)['name'])
+    self.assertEqual('feature b', rediscache.get(lookup_key_2)['name'])
+
+  def test_get_feature_names_by_ids__cache_hit(self):
+    """We can load feature names from rediscache."""
+    cache_key = '%s|%s' % (
+        FeatureEntry.FEATURE_NAME_CACHE_KEY, self.feature_1.key.integer_id())
+    cached_feature = {
+      'name': 'fake cached_feature',
+      'id': self.feature_1.key.integer_id()
+    }
+    rediscache.set(cache_key, cached_feature)
+
+    actual = feature_helpers.get_feature_names_by_ids([self.feature_1.key.integer_id()])
+
+    self.assertEqual(1, len(actual))
+    self.assertEqual(2, len(actual[0]))
+    self.assertEqual(cached_feature, actual[0])
+
+  def test_get_feature_names_by_ids__batch_order(self):
+    """Feature names are returned in the order of the given IDs."""
+    actual = feature_helpers.get_feature_names_by_ids([
+        self.feature_4.key.integer_id(),
+        self.feature_1.key.integer_id(),
+        self.feature_3.key.integer_id(),
+        self.feature_2.key.integer_id(),
+    ])
+
+    self.assertEqual(4, len(actual))
+    self.assertEqual(2, len(actual[0]))
+    self.assertEqual('feature d', actual[0]['name'])
+    self.assertEqual('feature a', actual[1]['name'])
+    self.assertEqual('feature c', actual[2]['name'])
+    self.assertEqual('feature b', actual[3]['name'])
+
+  def test_get_feature_names_by_ids__cached_correctly(self):
+    """We should no longer be able to trigger bug #1647."""
+    # Cache one to try to trigger the bug.
+    feature_helpers.get_feature_names_by_ids([self.feature_2.key.integer_id()])
+
+    # Now do the lookup, but it would cache feature_2 at the key for feature_3.
+    feature_helpers.get_feature_names_by_ids([
+        self.feature_4.key.integer_id(),
+        self.feature_1.key.integer_id(),
+        self.feature_3.key.integer_id(),
+        self.feature_2.key.integer_id(),
+    ])
+
+    # This would read the incorrect cache entry and use it.
+    actual = feature_helpers.get_feature_names_by_ids([
+        self.feature_4.key.integer_id(),
+        self.feature_1.key.integer_id(),
+        self.feature_3.key.integer_id(),
+        self.feature_2.key.integer_id(),
+    ])
+
+    self.assertEqual(4, len(actual))
+    self.assertEqual(2, len(actual[0]))
+    self.assertEqual('feature d', actual[0]['name'])
+    self.assertEqual('feature a', actual[1]['name'])
+    self.assertEqual('feature c', actual[2]['name'])
+    self.assertEqual('feature b', actual[3]['name'])
+
   def test_get_in_milestone__normal(self):
     """We can retrieve a list of features."""
     self.feature_1.impl_status_chrome = 5
@@ -382,3 +466,109 @@ class FeatureHelpersTest(testing_config.CustomTestCase):
     self.assertEqual(
         cached_test_feature,
         actual)
+
+  def test_get_in_milestone__non_enterprise_features(self):
+    """We can retrieve a list of features."""
+    self.fe_1_stages_dict[160][0].milestones = MilestoneSet(desktop_first=1)
+    self.fe_1_stages_dict[160][0].put()
+    self.fe_2_stages_dict[260][0].milestones = MilestoneSet(desktop_last=2)
+    self.fe_2_stages_dict[260][0].put()
+    self.fe_3_stages_dict[360][0].milestones = MilestoneSet(ios_first=3)
+    self.fe_3_stages_dict[360][0].put()
+    self.fe_4_stages_dict[460][0].milestones = MilestoneSet(ios_last=4)
+    self.fe_4_stages_dict[460][0].put()
+
+    cache_key = '%s|%s|%s' % (
+        FeatureEntry.DEFAULT_CACHE_KEY, 'release_notes_milestone', 1)
+
+    # There is no breaking change
+    features = feature_helpers.get_features_in_release_notes(milestone=1)
+    self.assertEqual(0, len(features))
+    cached_result = rediscache.get(cache_key)
+    rediscache.delete(cache_key)
+    self.assertEqual(cached_result, features)
+
+    # Features 1, 2, 3 and 4 are breaking changes
+    self.feature_1.enterprise_impact = ENTERPRISE_IMPACT_LOW
+    self.feature_1.put()
+    self.feature_2.enterprise_impact = ENTERPRISE_IMPACT_MEDIUM
+    self.feature_2.put()
+    self.feature_3.enterprise_impact = ENTERPRISE_IMPACT_HIGH
+    self.feature_3.put()
+    self.feature_4.enterprise_impact = ENTERPRISE_IMPACT_LOW
+    self.feature_4.put()
+
+    features = feature_helpers.get_features_in_release_notes(milestone=1)
+    self.assertEqual(4, len(features))
+    self.assertEqual(
+      ['feature a', 'feature b', 'feature c', 'feature d'],
+      [f['name'] for f in features])
+    cached_result = rediscache.get(cache_key)
+    rediscache.delete(cache_key)
+    self.assertEqual(cached_result, features)
+
+    cache_key = '%s|%s|%s' % (
+        FeatureEntry.DEFAULT_CACHE_KEY, 'release_notes_milestone', 3)
+    features = feature_helpers.get_features_in_release_notes(milestone=3)
+    self.assertEqual(2, len(features))
+    self.assertEqual(
+      ['feature c', 'feature d'],
+      [f['name'] for f in features])
+    cached_result = rediscache.get(cache_key)
+    rediscache.delete(cache_key)
+    self.assertEqual(cached_result, features)
+
+    # Features 1, 2, 3 are breaking changes
+    # only feature 1, 2 and 4 are planned to be released
+    self.feature_4.enterprise_impact = ENTERPRISE_IMPACT_NONE
+    self.feature_4.put()
+    self.fe_3_stages_dict[360][0].milestones = MilestoneSet()
+    self.fe_3_stages_dict[360][0].put()
+
+    features = feature_helpers.get_features_in_release_notes(milestone=3)
+    self.assertEqual(0, len(features))
+    cached_result = rediscache.get(cache_key)
+    rediscache.delete(cache_key)
+    self.assertEqual(cached_result, features)
+
+    cache_key = '%s|%s|%s' % (
+        FeatureEntry.DEFAULT_CACHE_KEY, 'release_notes_milestone', 1)
+    features = feature_helpers.get_features_in_release_notes(milestone=1)
+    self.assertEqual(2, len(features))
+    self.assertEqual(
+      ['feature a', 'feature b'],
+      [f['name'] for f in features])
+    cached_result = rediscache.get(cache_key)
+    rediscache.delete(cache_key)
+    self.assertEqual(cached_result, features)
+
+    # Enterprise features are included
+    rollout_stage = Stage(
+        feature_id=self.feature_4.key.integer_id(),
+        stage_type=STAGE_ENT_ROLLOUT,
+        rollout_milestone=1)
+    rollout_stage.put()
+    self.feature_4.feature_type = 4
+    self.feature_4.put()
+
+    features = feature_helpers.get_features_in_release_notes(milestone=1)
+    self.assertEqual(3, len(features))
+    self.assertEqual(
+      ['feature a', 'feature b', 'feature d'],
+      [f['name'] for f in features])
+    cached_result = rediscache.get(cache_key)
+    rediscache.delete(cache_key)
+    self.assertEqual(cached_result, features)
+
+    # Deleted features are not included
+    self.feature_4.deleted = True
+    self.feature_4.put()
+    features = feature_helpers.get_features_in_release_notes(milestone=1)
+    self.assertEqual(2, len(features))
+    self.assertEqual(
+      ['feature a', 'feature b'],
+      [f['name'] for f in features])
+    cached_result = rediscache.get(cache_key)
+    rediscache.delete(cache_key)
+    self.assertEqual(cached_result, features)
+

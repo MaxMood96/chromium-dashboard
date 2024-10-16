@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
+from chromestatus_openapi.models import (Process)
 import dataclasses
 from framework import basehandlers
 from internals import core_models
@@ -35,8 +35,10 @@ class ProcessesAPI(basehandlers.APIHandler):
 
     feature_process = processes.ALL_PROCESSES.get(
       f.feature_type, processes.BLINK_LAUNCH_PROCESS)
-    result = processes.process_to_dict(feature_process)
-    if f.feature_type != core_enums.FEATURE_TYPE_ENTERPRISE_ID and f.breaking_change:
+    process_model = Process.from_dict(processes.process_to_dict(feature_process))
+    result = process_model.to_dict()
+    if (f.feature_type != core_enums.FEATURE_TYPE_ENTERPRISE_ID and
+        f.enterprise_impact > core_enums.ENTERPRISE_IMPACT_NONE):
       result['stages'].insert(-1, dataclasses.asdict(processes.FEATURE_ROLLOUT_STAGE))
       result['stages'][-1]['incoming_stage'] = core_enums.INTENT_ROLLOUT
 

@@ -17,13 +17,26 @@
 # https://stackoverflow.com/a/33533514
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from google.cloud import ndb  # type: ignore
 
 from framework import rediscache
 from internals.core_enums import *
 import settings
+
+
+class ReviewResultProperty(ndb.StringProperty):
+  """A StringProperty representing the result of an external review.
+
+  These are the values after the `:` in
+  https://github.com/mozilla/standards-positions/labels?q=position%3A,
+  https://github.com/WebKit/standards-positions/labels?q=position%3A, and
+  https://github.com/w3ctag/design-reviews/labels?q=resolution%3A, plus the special value "closed"
+  to represent a review that was closed without a position.
+  """
+
+  CLOSED_WITHOUT_POSITION = 'closed'
 
 
 class FeatureEntry(ndb.Model):  # Copy from Feature
@@ -88,7 +101,10 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   bug_url = ndb.StringProperty()  # Tracking bug
   launch_bug_url = ndb.StringProperty()  # FLT or go/launch
   screenshot_links = ndb.StringProperty(repeated=True)
+  first_enterprise_notification_milestone = ndb.IntegerProperty()
+  enterprise_impact = ndb.IntegerProperty(default=ENTERPRISE_IMPACT_NONE)
   breaking_change = ndb.BooleanProperty(default=False)
+  shipping_year = ndb.IntegerProperty()
 
   # Implementation in Chrome
   impl_status_chrome = ndb.IntegerProperty(required=True, default=NO_ACTIVE_DEV)
@@ -120,6 +136,7 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   all_platforms_descr = ndb.TextProperty()
   tag_review = ndb.StringProperty()
   tag_review_status = ndb.IntegerProperty(default=REVIEW_PENDING)
+  tag_review_resolution: Optional[ReviewResultProperty] = ReviewResultProperty()
   non_oss_deps = ndb.TextProperty()
   anticipated_spec_changes = ndb.TextProperty()
 
@@ -127,12 +144,34 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   safari_views = ndb.IntegerProperty(required=True, default=NO_PUBLIC_SIGNALS)
   web_dev_views = ndb.IntegerProperty(required=True, default=DEV_NO_SIGNALS)
   ff_views_link = ndb.StringProperty()
+  ff_views_link_result: Optional[ReviewResultProperty] = ReviewResultProperty()
   safari_views_link = ndb.StringProperty()
+  safari_views_link_result: Optional[ReviewResultProperty] = ReviewResultProperty()
   web_dev_views_link = ndb.StringProperty()
   ff_views_notes = ndb.StringProperty()
   safari_views_notes = ndb.TextProperty()
   web_dev_views_notes = ndb.TextProperty()
   other_views_notes = ndb.TextProperty()
+
+  @ndb.ComputedProperty
+  def has_open_tag_review(self):
+    return self.tag_review is not None and self.tag_review_resolution is None
+
+  @ndb.ComputedProperty
+  def has_open_ff_review(self):
+    return (
+      self.ff_views not in [IN_DEV, SHIPPED, SIGNALS_NA]
+      and self.ff_views_link is not None
+      and self.ff_views_link_result is None
+    )
+
+  @ndb.ComputedProperty
+  def has_open_safari_review(self):
+    return (
+      self.safari_views not in [IN_DEV, SHIPPED, SIGNALS_NA]
+      and self.safari_views_link is not None
+      and self.safari_views_link_result is None
+    )
 
   # Gate: Security & Privacy
   security_risks = ndb.TextProperty()
@@ -154,7 +193,14 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   # Legacy fields that we display on old entries, but don't allow editing.
   experiment_timeline = ndb.TextProperty()  # Display-only
 
+  # The prefix of rediscache keys for storing all information
+  # about a feature.
   DEFAULT_CACHE_KEY = 'FeatureEntries'
+  # The prefix of rediscache keys for storing the feature name
+  # of a feature.
+  FEATURE_NAME_CACHE_KEY = 'FeatureNames'
+  # The prefix used when cacheing entire search results.
+  SEARCH_CACHE_KEY = 'FeatureSearch'
 
   def __init__(self, *args, **kwargs):
     # Initialise Feature.blink_components with a default value.  If
@@ -171,16 +217,18 @@ class FeatureEntry(ndb.Model):  # Copy from Feature
   def feature_cache_key(cls, cache_key, feature_id):
     return '%s|%s' % (cache_key, feature_id)
 
-  @classmethod
-  def feature_cache_prefix(cls):
-    return '%s|*' % (cls.DEFAULT_CACHE_KEY)
-
   def put(self, **kwargs) -> Any:
     key = super(FeatureEntry, self).put(**kwargs)
     # Invalidate rediscache for the individual feature view.
     cache_key = FeatureEntry.feature_cache_key(
         FeatureEntry.DEFAULT_CACHE_KEY, self.key.integer_id())
     rediscache.delete(cache_key)
+
+    # Invalidate rediscache for the individual feature name.
+    cache_key = FeatureEntry.feature_cache_key(
+        FeatureEntry.FEATURE_NAME_CACHE_KEY, self.key.integer_id())
+    rediscache.delete(cache_key)
+    rediscache.delete_keys_with_prefix(FeatureEntry.SEARCH_CACHE_KEY)
 
     return key
 
@@ -280,11 +328,25 @@ class Stage(ndb.Model):
   origin_trial_feedback_url = ndb.StringProperty()
   experiment_goals = ndb.TextProperty()
   experiment_risks = ndb.TextProperty()
+  ot_action_requested = ndb.BooleanProperty(default=False)
+  ot_activation_date = ndb.DateProperty()
+  ot_approval_buganizer_component = ndb.IntegerProperty()
+  ot_approval_buganizer_custom_field_id = ndb.IntegerProperty()
+  ot_approval_criteria_url = ndb.StringProperty()
+  ot_approval_group_email = ndb.StringProperty()
   ot_chromium_trial_name = ndb.StringProperty()
+  ot_description = ndb.TextProperty()
+  ot_display_name = ndb.StringProperty()
   ot_documentation_url = ndb.StringProperty()
+  ot_emails = ndb.StringProperty(repeated=True)
+  ot_feedback_submission_url = ndb.StringProperty()
   ot_has_third_party_support = ndb.BooleanProperty(default=False)
   ot_is_critical_trial = ndb.BooleanProperty(default=False)
   ot_is_deprecation_trial = ndb.BooleanProperty(default=False)
+  ot_owner_email = ndb.StringProperty()
+  ot_request_note = ndb.TextProperty()  # Deprecated.
+  ot_require_approvals = ndb.BooleanProperty(default=False)
+  ot_setup_status = ndb.IntegerProperty()
   ot_webfeature_use_counter = ndb.StringProperty()
 
   # Origin trial stage id that this stage extends, if trial extension stage.

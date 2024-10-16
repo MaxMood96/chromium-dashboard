@@ -21,13 +21,18 @@ import werkzeug.exceptions  # Flask HTTP stuff.
 from google.cloud import ndb  # type: ignore
 
 from api import reviews_api
-from internals import core_enums
+from internals import approval_defs
+from internals.core_enums import *
 from internals import core_models
 from internals.review_models import Gate, Vote
 
 test_app = flask.Flask(__name__)
 
 NOW = datetime.datetime.now()
+
+ALL_SHIPPING_GATE_TYPES = [
+    GATE_PRIVACY_SHIP, GATE_SECURITY_SHIP, GATE_ENTERPRISE_SHIP,
+    GATE_DEBUGGABILITY_SHIP, GATE_TESTING_SHIP, GATE_API_SHIP]
 
 
 class VotesAPITest(testing_config.CustomTestCase):
@@ -229,8 +234,9 @@ class VotesAPITest(testing_config.CustomTestCase):
     self.assertEqual(vote.set_by, 'reviewer1@example.com')
     self.assertEqual(vote.state, Vote.NEEDS_WORK)
 
-    mock_notifier.assert_called_once_with(self.feature_1,
-        self.gate_1, 'reviewer1@example.com', Vote.NEEDS_WORK, Vote.NA)
+    mock_notifier.assert_called_once_with(
+        self.feature_1, self.gate_1, 'reviewer1@example.com',
+        Vote.NEEDS_WORK, Vote.NO_RESPONSE)
 
   @mock.patch('internals.notifier_helpers.notify_subscribers_of_vote_changes')
   @mock.patch('internals.approval_defs.get_approvers')
@@ -254,8 +260,9 @@ class VotesAPITest(testing_config.CustomTestCase):
     self.assertEqual(vote.set_by, 'reviewer1@example.com')
     self.assertEqual(vote.state, Vote.DENIED)
 
-    mock_notifier.assert_called_once_with(self.feature_1,
-        self.gate_1, 'reviewer1@example.com', Vote.DENIED, Vote.NA)
+    mock_notifier.assert_called_once_with(
+        self.feature_1, self.gate_1, 'reviewer1@example.com',
+        Vote.DENIED, Vote.APPROVED)
 
   @mock.patch('internals.notifier_helpers.notify_approvers_of_reviews')
   @mock.patch('internals.approval_defs.get_approvers')
@@ -278,7 +285,9 @@ class VotesAPITest(testing_config.CustomTestCase):
     self.assertEqual(vote.set_by, 'owner1@example.com')
     self.assertEqual(vote.state, Vote.REVIEW_REQUESTED)
 
-    mock_notifier.assert_called_once_with(self.feature_1, self.gate_1)
+    mock_notifier.assert_called_once_with(
+        self.feature_1, self.gate_1, Vote.REVIEW_REQUESTED,
+        'owner1@example.com')
 
 
 class GatesAPITest(testing_config.CustomTestCase):
@@ -322,31 +331,20 @@ class GatesAPITest(testing_config.CustomTestCase):
                 "gate_type": 1,
                 "team_name": "API Owners",
                 "gate_name": "Intent to Prototype",
+                "escalation_email": None,
                 "state": 1,
                 "requested_on": None,
                 "responded_on": None,
-                "owners": [],
+                "assignee_emails": [],
                 "next_action": None,
                 "additional_review": False,
                 'slo_initial_response': 5,
                 'slo_initial_response_took': None,
                 'slo_initial_response_remaining': None,
+                'possible_assignee_emails': ['reviewer1@example.com'],
             },
         ],
-        "possible_owners": {
-            1: ["reviewer1@example.com"],
-            2: ["reviewer1@example.com"],
-            3: ["reviewer1@example.com"],
-            4: ["reviewer1@example.com"],
-            32: ["reviewer1@example.com"],
-            34: ["reviewer1@example.com"],
-            42: ["reviewer1@example.com"],
-            44: ["reviewer1@example.com"],
-            54: ["reviewer1@example.com"],
-            62: ["reviewer1@example.com"],
-            64: ["reviewer1@example.com"],
-            74: ["reviewer1@example.com"],
-        }}
+        }
 
     self.assertEqual(actual, expected)
 
@@ -360,6 +358,106 @@ class GatesAPITest(testing_config.CustomTestCase):
 
     expected = {
         'gates': [],
-        'possible_owners': {}
     }
     self.assertEqual(actual, expected)
+
+
+class XfnGatesAPITest(testing_config.CustomTestCase):
+
+  def setUp(self):
+    self.feature_1 = core_models.FeatureEntry(
+        name='feature one', summary='sum', category=1,
+        owner_emails=['owner1@example.com'])
+    self.feature_1.put()
+    self.feature_id = self.feature_1.key.integer_id()
+
+    self.stage_1 = core_models.Stage(
+        feature_id=self.feature_id, stage_type=STAGE_BLINK_SHIPPING)
+    self.stage_1.put()
+    self.stage_id = self.stage_1.key.integer_id()
+
+    self.gate_1 = Gate(id=1, feature_id=self.feature_id, stage_id=self.stage_id,
+        gate_type=GATE_API_SHIP, state=Vote.NA)
+    self.gate_1.put()
+    self.gate_1_id = self.gate_1.key.integer_id()
+
+    self.handler = reviews_api.XfnGatesAPI()
+    self.request_path = '/api/v0/features/%d/stages/%d/addXfnGates' % (
+        self.feature_id, self.stage_id)
+
+  def tearDown(self):
+    self.feature_1.key.delete()
+    kinds: list[ndb.Model] = [Gate, Vote]
+    for kind in kinds:
+      for entity in kind.query():
+        entity.key.delete()
+
+  def test_get(self):
+    """We reject all GETs to this endpoint."""
+    with test_app.test_request_context(self.request_path):
+      with self.assertRaises(werkzeug.exceptions.MethodNotAllowed):
+        self.handler.do_get()
+
+  def test_do_post__not_found(self):
+    """Handler rejects bad requests."""
+    with test_app.test_request_context(self.request_path):
+      with self.assertRaises(werkzeug.exceptions.NotFound):
+        self.handler.do_post(
+            feature_id=self.feature_id + 1, stage_id=self.stage_id)
+
+    with test_app.test_request_context(self.request_path):
+      with self.assertRaises(werkzeug.exceptions.NotFound):
+        self.handler.do_post(
+            feature_id=self.feature_id, stage_id=self.stage_id + 1)
+
+  def test_do_post__not_allowed(self):
+    """Handler rejects users who lack permission."""
+    testing_config.sign_out()
+    with test_app.test_request_context(self.request_path):
+      with self.assertRaises(werkzeug.exceptions.Forbidden):
+        self.handler.do_post(
+            feature_id=self.feature_id, stage_id=self.stage_id)
+
+    testing_config.sign_in('other@example.com', 999)
+    with test_app.test_request_context(self.request_path):
+      with self.assertRaises(werkzeug.exceptions.Forbidden):
+        self.handler.do_post(
+            feature_id=self.feature_id, stage_id=self.stage_id)
+
+  @mock.patch('api.reviews_api.XfnGatesAPI.create_xfn_gates')
+  def test_do_post__editors_allowed(self, mock_create):
+    """Handler accepts users who can edit the feature."""
+    testing_config.sign_in('owner1@example.com', 123567890)
+    mock_create.return_value = 111
+    with test_app.test_request_context(self.request_path):
+      actual = self.handler.do_post(
+          feature_id=self.feature_id, stage_id=self.stage_id)
+
+    mock_create.assert_called_once_with(self.feature_id, self.stage_id)
+    self.assertEqual(actual, {'message': 'Created 111 gates'})
+
+  @mock.patch('api.reviews_api.XfnGatesAPI.create_xfn_gates')
+  def test_do_post__reviewers_allowed(self, mock_create):
+    """Handler accepts users who can review any gate."""
+    testing_config.sign_in(approval_defs.ENTERPRISE_APPROVERS[0], 123567890)
+    mock_create.return_value = 222
+    with test_app.test_request_context(self.request_path):
+      actual = self.handler.do_post(
+          feature_id=self.feature_id, stage_id=self.stage_id)
+
+    mock_create.assert_called_once_with(self.feature_id, self.stage_id)
+    self.assertEqual(actual, {'message': 'Created 222 gates'})
+
+  def test_get_needed_gate_types(self):
+    """We always assume that we are adding all gates for STAGE_BLINK_SHIPPING."""
+    actual = self.handler.get_needed_gate_types()
+    self.assertEqual(actual,ALL_SHIPPING_GATE_TYPES)
+
+  def test_create_xfn_gates__normal(self):
+    """We can create the missing gates from STAGE_BLINK_SHIPPING."""
+    actual = self.handler.create_xfn_gates(self.feature_id, self.stage_id)
+
+    self.assertEqual(actual, 5)
+    actual_gates_dict = Gate.get_feature_gates(self.feature_id)
+    self.assertCountEqual(
+        actual_gates_dict.keys(), ALL_SHIPPING_GATE_TYPES)

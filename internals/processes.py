@@ -17,8 +17,6 @@ from dataclasses import asdict, dataclass
 
 from internals import approval_defs
 from internals import core_enums
-from internals import core_models
-from internals import stage_helpers
 
 
 @dataclass
@@ -42,7 +40,7 @@ class ProcessStage:
   description: str
   progress_items: list[ProgressItem]
   actions: list[Action]
-  approvals: list[approval_defs.ApprovalFieldDef]
+  approvals: list[approval_defs.GateInfo]
   incoming_stage: int
   outgoing_stage: int
   stage_type: int | None
@@ -70,13 +68,11 @@ def process_to_dict(process):
 
 # This page generates a preview of an email that can be sent
 # to a mailing list to announce an intent.
-# {feature_id} and {outgoing_stage} are filled in by JS code.
+# {feature_id}, {intent_stage}, and {gate_id} are filled in by JS code.
 # The param "intent" adds clauses the template to include details
 # needed for an intent email.  The param "launch" causes those
 # details to be omitted and a link to create a launch bug shown instead.
-INTENT_EMAIL_URL = ('/admin/features/launch/{feature_id}'
-                    '/{outgoing_stage}'
-                    '?intent=1')
+INTENT_EMAIL_URL = ('/feature/{feature_id}/gate/{gate_id}/intent')
 LAUNCH_BUG_TEMPLATE_URL = '/admin/features/launch/{feature_id}?launch=1'
 # TODO(jrobbins): Creation of the launch bug has been a TODO for 5 years.
 
@@ -265,8 +261,17 @@ BLINK_PROCESS_STAGES = [
                PI_EXPLAINER.name, PI_SPEC_LINK.name,
                PI_EST_TARGET_MILESTONE.name])],
       [approval_defs.ExperimentApproval],
-      core_enums.INTENT_IMPLEMENT_SHIP, core_enums.INTENT_EXTEND_TRIAL,
+      core_enums.INTENT_IMPLEMENT_SHIP, core_enums.INTENT_ORIGIN_TRIAL,
       stage_type=core_enums.STAGE_BLINK_ORIGIN_TRIAL),
+
+  ProcessStage(
+    'Extend origin trial',
+    '(Optional) Extend an existing origin trial.',
+    [],
+    [Action('Draft Intent to Extend Experiment email', INTENT_EMAIL_URL, [])],
+    [approval_defs.ExtendExperimentApproval],
+    core_enums.INTENT_ORIGIN_TRIAL, core_enums.INTENT_EXTEND_ORIGIN_TRIAL,
+    stage_type=core_enums.STAGE_BLINK_EXTEND_ORIGIN_TRIAL),
 
   ProcessStage(
       'Prepare to ship',
@@ -356,8 +361,17 @@ BLINK_FAST_TRACK_STAGES = [
       [Action('Draft Intent to Experiment email', INTENT_EMAIL_URL,
               [PI_SPEC_LINK.name, PI_EST_TARGET_MILESTONE.name])],
       [approval_defs.ExperimentApproval],
-      core_enums.INTENT_EXPERIMENT, core_enums.INTENT_EXTEND_TRIAL,
+      core_enums.INTENT_EXPERIMENT, core_enums.INTENT_ORIGIN_TRIAL,
       stage_type=core_enums.STAGE_FAST_ORIGIN_TRIAL),
+
+  ProcessStage(
+    'Extend origin trial',
+    '(Optional) Extend an existing origin trial.',
+    [],
+    [Action('Draft Intent to Extend Experiment email', INTENT_EMAIL_URL, [])],
+    [approval_defs.ExtendExperimentApproval],
+    core_enums.INTENT_ORIGIN_TRIAL, core_enums.INTENT_EXTEND_ORIGIN_TRIAL,
+    stage_type=core_enums.STAGE_FAST_EXTEND_ORIGIN_TRIAL),
 
   ProcessStage(
       'Prepare to ship',
@@ -432,7 +446,7 @@ PSA_ONLY_STAGES = [
        PI_UPDATED_TARGET_MILESTONE,
        PI_I2S_EMAIL,
       ],
-      [Action('Draft Intent to Ship email', INTENT_EMAIL_URL,
+      [Action('Draft Web-Facing Change PSA email', INTENT_EMAIL_URL,
               [PI_SPEC_LINK.name,
                PI_FINCH_FEATURE_OR_JUSTIFY.name,
                PI_UPDATED_TARGET_MILESTONE.name])],
@@ -464,10 +478,10 @@ PSA_ONLY_PROCESS = Process(
 
 DEPRECATION_STAGES = [
   ProcessStage(
-      'Write up motivation',
+      'Write up deprecation plan',
       'Create an initial WebStatus feature entry to deprecate '
       'an existing feature, including motivation and impact. '
-      'Then, move existing Chromium code under a flag.',
+      'Then, get approval for your deprecation plans.',
       [PI_EXISTING_FEATURE,
        PI_MOTIVATION,
       ],
@@ -505,15 +519,25 @@ DEPRECATION_STAGES = [
       [Action('Draft Request for Deprecation Trial email', INTENT_EMAIL_URL,
               [PI_MOTIVATION.name, PI_VENDOR_SIGNALS.name,
                PI_EST_TARGET_MILESTONE.name])],
-      # TODO(jrobbins): Intent to extend deprecation.
       [approval_defs.ExperimentApproval],
-      core_enums.INTENT_EXPERIMENT, core_enums.INTENT_EXTEND_TRIAL,
+      core_enums.INTENT_EXPERIMENT, core_enums.INTENT_ORIGIN_TRIAL,
       stage_type=core_enums.STAGE_DEP_DEPRECATION_TRIAL),
+
+  ProcessStage(
+    'Extend deprecation trial',
+    '(Optional) Extend an existing deprecation trial.',
+    [],
+    [Action('Draft Intent to Extend Deprecation Trial email',
+            INTENT_EMAIL_URL, [])],
+    [approval_defs.ExtendExperimentApproval],
+    core_enums.INTENT_ORIGIN_TRIAL, core_enums.INTENT_EXTEND_ORIGIN_TRIAL,
+    stage_type=core_enums.STAGE_DEP_EXTEND_DEPRECATION_TRIAL),
 
   ProcessStage(
       'Prepare to ship',
       'Lock in shipping milestone. '
-      'Finalize docs and announcements before disabling feature by default.',
+      'Finalize docs and announcements before disabling feature by default. '
+      'If there were changes since your plan approvals, get approvals again.',
       [PI_UPDATED_TARGET_MILESTONE,
        PI_I2S_EMAIL,
        PI_I2S_LGTMS,
@@ -583,15 +607,18 @@ ALL_PROCESSES = {
     }
 
 
-INTENT_EMAIL_SECTIONS = {
+INTENT_EMAIL_SECTIONS: dict[int, list[str]] = {
     core_enums.INTENT_NONE: [],
     core_enums.INTENT_INCUBATE: [],
     core_enums.INTENT_IMPLEMENT: ['motivation'],
     core_enums.INTENT_EXPERIMENT: ['i2p_thread', 'experiment'],
     core_enums.INTENT_IMPLEMENT_SHIP: [
         'need_api_owners_lgtms', 'motivation', 'tracking_bug', 'sample_links'],
-    core_enums.INTENT_EXTEND_TRIAL: [
+    core_enums.INTENT_ORIGIN_TRIAL: [
         'i2p_thread', 'experiment', 'extension_reason'],
+    core_enums.INTENT_EXTEND_ORIGIN_TRIAL: [
+      'i2p_thread', 'experiment', 'extension_reason',
+    ],
     core_enums.INTENT_SHIP: [
         'need_api_owners_lgtms', 'i2p_thread', 'tracking_bug', 'sample_links',
         'anticipated_spec_changes', 'ship'],

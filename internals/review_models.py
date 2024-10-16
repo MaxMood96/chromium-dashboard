@@ -22,7 +22,6 @@ import logging
 from typing import Optional
 from google.cloud import ndb  # type: ignore
 
-
 class OwnersFile(ndb.Model):
   """Describes the properties to store raw API_OWNERS content."""
   url = ndb.StringProperty(required=True)
@@ -37,7 +36,7 @@ class OwnersFile(ndb.Model):
     return self.put()
 
   @classmethod
-  def get_raw_owner_file(cls, url):
+  def get_raw_owner_file(cls, url) -> OwnersFile | None:
     """Retrieve raw the owner file's content, if it is created with an hour."""
     q = cls.query()
     q = q.filter(cls.url == url)
@@ -46,13 +45,40 @@ class OwnersFile(ndb.Model):
       logging.info('API_OWNERS content does not exist for URL %s.' % (url))
       return None
 
-    owners_file = owners_file_list[0]
-    # Check if it is created within an hour.
-    an_hour_before = datetime.datetime.now() - datetime.timedelta(hours=1)
-    if owners_file.created_on < an_hour_before:
-      return None
+    return owners_file_list[0]
 
-    return owners_file.raw_content
+  def is_fresh(self) -> bool:
+    """Check if it was created within the past hour."""
+    an_hour_before = datetime.datetime.now() - datetime.timedelta(hours=1)
+    return self.created_on > an_hour_before
+
+
+class GateDef(ndb.Model):
+  """Configuration for a review gate."""
+  gate_type = ndb.IntegerProperty(required=True)
+  approvers = ndb.StringProperty(repeated=True)
+  rotation_url = ndb.StringProperty()
+
+  # TODO(jrobbins): Use these and phase out approval_devs.ApprovalFieldDef.
+  name = ndb.StringProperty()
+  description = ndb.StringProperty()
+  rule = ndb.StringProperty()
+  team_name = ndb.StringProperty()
+  slo_initial_response = ndb.IntegerProperty()
+
+  @classmethod
+  def get_gate_def(cls, gate_type: int) -> GateDef:
+    """Load an existing GateDef and or create a new one."""
+    query: ndb.Query = GateDef.query(GateDef.gate_type == gate_type)
+    gate_defs = query.fetch(1)
+    if gate_defs:
+      gate_def = gate_defs[0]
+    else:
+      logging.info(f'Creating empty GateDef for {gate_type}')
+      gate_def = GateDef(gate_type=gate_type)
+      gate_def.put()
+
+    return gate_def
 
 
 class Vote(ndb.Model):
@@ -67,6 +93,7 @@ class Vote(ndb.Model):
   DENIED = 6
   NO_RESPONSE = 7
   INTERNAL_REVIEW = 8
+  NA_REQUESTED = 9
   VOTE_VALUES = {
       # Not used: PREPARING: 'preparing',
       NA: 'na',
@@ -77,6 +104,7 @@ class Vote(ndb.Model):
       DENIED: 'denied',
       NO_RESPONSE: 'no_response',
       INTERNAL_REVIEW: 'internal_review',
+      NA_REQUESTED: 'na_requested',
   }
 
   FINAL_STATES = [NA, APPROVED, DENIED]
@@ -105,10 +133,12 @@ class Vote(ndb.Model):
       query = query.filter(Vote.state.IN(states))
     if set_by is not None:
       query = query.filter(Vote.set_by == set_by)
+    logging.info('query is %r', query)
     # Query with STRONG consistency because ndb defaults to
     # EVENTUAL consistency and we run this query immediately after
     # saving the user's change that we want included in the query.
     votes: list[Vote] = query.fetch(limit, read_consistency=ndb.STRONG)
+    logging.info('found %r Votes', len(votes))
     return votes
 
   @classmethod
@@ -125,7 +155,7 @@ class Gate(ndb.Model):
   PREPARING = 0
   PENDING_STATES = [
       Vote.REVIEW_REQUESTED, Vote.REVIEW_STARTED, Vote.NEEDS_WORK,
-      Vote.INTERNAL_REVIEW]
+      Vote.INTERNAL_REVIEW, Vote.NA_REQUESTED]
   FINAL_STATES = [Vote.NA, Vote.APPROVED, Vote.DENIED]
 
   feature_id = ndb.IntegerProperty(required=True)
@@ -139,7 +169,7 @@ class Gate(ndb.Model):
   # The first comment or vote on this gate from a reviewer after the request.
   responded_on = ndb.DateTimeProperty()
 
-  owners = ndb.StringProperty(repeated=True)
+  assignee_emails = ndb.StringProperty(repeated=True)
   next_action = ndb.DateProperty()
   additional_review = ndb.BooleanProperty(default=False)
 
@@ -170,7 +200,7 @@ class Amendment(ndb.Model):
   new_value = ndb.TextProperty()
 
 
-class Activity(ndb.Model):  # copy from Comment
+class Activity(ndb.Model):
   """An activity log entry (comment + amendments) on a gate or feature."""
   feature_id = ndb.IntegerProperty(required=True)
   gate_id = ndb.IntegerProperty()  # The gate commented on, or general comment.
@@ -184,12 +214,11 @@ class Activity(ndb.Model):  # copy from Comment
   @classmethod
   def get_activities(cls, feature_id: int, gate_id: Optional[int]=None,
       comments_only: bool=False) -> list[Activity]:
-    """Return actitivies for an approval."""
+    """Return all actitivies for a feature, or a specific gate."""
     query = Activity.query().order(Activity.created)
     query = query.filter(Activity.feature_id == feature_id)
     if gate_id:
-      # Fetch activities with a gate_id or None value.
-      query = query.filter(Activity.gate_id.IN([gate_id, None]))
+      query = query.filter(Activity.gate_id == gate_id)
     acts = query.fetch(None)
     if comments_only:
       return [act for act in acts if act.content]

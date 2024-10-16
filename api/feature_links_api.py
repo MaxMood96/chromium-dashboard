@@ -13,10 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from framework import basehandlers
+from chromestatus_openapi.models import (
+  FeatureLinksResponse,
+  FeatureLinksSample,
+  FeatureLinksSummaryResponse,
+)
+
+from framework import basehandlers, permissions
 from internals.core_enums import *
 from internals.core_models import FeatureEntry
-from internals import feature_links
+from internals.feature_links import (
+  get_by_feature_id,
+  get_feature_links_samples,
+  get_feature_links_summary,
+)
 
 
 class FeatureLinksAPI(basehandlers.APIHandler):
@@ -26,7 +36,7 @@ class FeatureLinksAPI(basehandlers.APIHandler):
     feature = FeatureEntry.get_by_id(feature_id)
     if not feature:
       self.abort(404, msg='Feature not found')
-    return feature_links.get_by_feature_id(feature_id, update_stale_links)
+    return get_by_feature_id(feature_id, update_stale_links)
 
   def do_get(self, **kwargs):
 
@@ -35,9 +45,28 @@ class FeatureLinksAPI(basehandlers.APIHandler):
     if feature_id:
       data, has_stale_links = self.get_feature_links(
           feature_id, update_stale_links)
-      return {
+      return FeatureLinksResponse.from_dict({
           "data": data,
           "has_stale_links": has_stale_links
-      }
+      })
     else:
       self.abort(400, msg='Missing feature_id')
+
+
+class FeatureLinksSummaryAPI(basehandlers.APIHandler):
+  """FeatureLinksSummaryAPI will return summary of links to the client."""
+
+  @permissions.require_admin_site
+  def do_get(self, **kwargs):
+    return FeatureLinksSummaryResponse.from_dict(get_feature_links_summary())
+
+class FeatureLinksSamplesAPI(basehandlers.APIHandler):
+  """FeatureLinksSamplesAPI will return sample links to the client."""
+
+  @permissions.require_admin_site
+  def do_get(self, **kwargs):
+    domain = self.request.args.get('domain', None)
+    type = self.request.args.get('type', None)
+    is_error = self.get_bool_arg('is_error', None)
+    if domain:
+      return FeatureLinksSample.from_dict(get_feature_links_samples(domain, type, is_error))
