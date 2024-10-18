@@ -27,6 +27,7 @@ from internals import approval_defs
 from internals.core_models import FeatureEntry, MilestoneSet
 from internals.review_models import Gate
 from internals import notifier
+from internals import ot_process_reminders
 from internals import stage_helpers
 from internals import slo
 from internals.core_enums import (
@@ -37,6 +38,7 @@ import settings
 CHROME_RELEASE_SCHEDULE_URL = (
     'https://chromiumdash.appspot.com/fetch_milestone_schedule')
 WEBSTATUS_EMAIL = 'webstatus@google.com'
+CBE_ESCLATION_EMAIL = 'cbe-releasenotes@google.com'
 STAGING_EMAIL = 'jrobbins-test@googlegroups.com'
 
 
@@ -58,8 +60,10 @@ def choose_email_recipients(
     return feature.owner_emails
 
   # Escalated notification. Add extended recipients.
-  ws_group_email = WEBSTATUS_EMAIL if settings.PROD else STAGING_EMAIL
-  all_notified_users = set([ws_group_email])
+  ws_group_emails = [STAGING_EMAIL]
+  if settings.PROD:
+    ws_group_emails = [WEBSTATUS_EMAIL, CBE_ESCLATION_EMAIL]
+  all_notified_users = set(ws_group_emails)
   all_notified_users.add(feature.creator_email)
   all_notified_users.update(feature.owner_emails)
   all_notified_users.update(feature.editor_emails)
@@ -89,7 +93,7 @@ def build_email_tasks(
       'feature': fe,
       'stage_info': stage_info,
       'should_render_mstone_table': stage_info['should_render_mstone_table'],
-      'site_url': settings.SITE_URL,
+      'SITE_URL': settings.SITE_URL,
       'milestone': mstone,
       'beta_date_str': beta_date_str,
       'is_escalated': is_escalated,
@@ -171,10 +175,13 @@ class AbstractReminderHandler(basehandlers.FlaskHandler):
         relevant_stages = stages.get(
             STAGE_TYPES_BY_FIELD_MAPPING[field][feature.feature_type] or -1, [])
         for stage in relevant_stages:
-          milestones = stage.milestones
-          m = (None if milestones is None
-              else getattr(milestones,
-                  MilestoneSet.MILESTONE_FIELD_MAPPING[field]))
+          if field == 'rollout_milestone':
+            m = getattr(stage, field)
+          else:
+            milestones = stage.milestones
+            m = (None if milestones is None
+                else getattr(milestones,
+                    MilestoneSet.MILESTONE_FIELD_MAPPING[field]))
           if m is not None and m >= min_mstone and m <= max_mstone:
             if min_milestone is None:
               min_milestone = m
@@ -228,7 +235,8 @@ class FeatureAccuracyHandler(AbstractReminderHandler):
       'shipped_android_milestone',
       'shipped_ios_milestone',
       'shipped_milestone',
-      'shipped_webview_milestone']
+      'shipped_webview_milestone',
+      'rollout_milestone']
 
   def prefilter_features(
       self,
@@ -310,3 +318,105 @@ class SLOReportHandler(basehandlers.FlaskHandler):
 
     return {'message': 'OK',
             'gates_by_reviewer': gates_by_reviewer}
+
+
+class SLOOverdueHandler(basehandlers.FlaskHandler):
+  JSONIFY = True
+  SUBJECT_FORMAT = 'Review due for: %s'
+  BODY_TEMPLATE_PATH = 'slo_overdue_email.html'
+
+  def get_template_data(self, **kwargs):
+    """Sends notifications to reviewers of newly overdue reviews."""
+    self.require_cron_header()
+    newly_overdue_gates, long_overdue_gates, relevant_features = (
+        self.get_overdue_gates_and_features())
+    newly_email_tasks = self.build_gate_email_tasks(
+        newly_overdue_gates, relevant_features, False)
+    long_email_tasks = self.build_gate_email_tasks(
+        long_overdue_gates, relevant_features, True)
+    email_tasks = newly_email_tasks + long_email_tasks
+    notifier.send_emails(email_tasks)
+
+    recipients_str = ''
+    # Add an alphabetical list of unique recipients to the return message.
+    if len(email_tasks):
+      recipients = '\n'.join(
+          sorted(list(set([task['to'] for task in email_tasks]))))
+      recipients_str = f'\nRecipients:\n{recipients}'
+    message =  f'{len(email_tasks)} email(s) sent or logged.{recipients_str}'
+    logging.info(message)
+
+    return {'message': message}
+
+  def get_overdue_gates_and_features(self):
+    """Return lists of newly and long overdue review gates, and their FEs."""
+    overdue_gates: list[Gate] = slo.get_overdue_gates(
+        approval_defs.APPROVAL_FIELDS_BY_ID, approval_defs.DEFAULT_SLO_LIMIT)
+    newly_overdue_gates: list[Gate] = []
+    long_overdue_gates: list[Gate] = []
+    relevant_feature_ids: set[int] = set()
+    for og in overdue_gates:
+      appr_def = approval_defs.APPROVAL_FIELDS_BY_ID.get(og.gate_type)
+      slo_limit = (appr_def.slo_initial_response
+                   if appr_def else approval_defs.DEFAULT_SLO_LIMIT)
+      remaining = slo.remaining_days(og.requested_on, slo_limit)
+      if remaining == -1:
+        newly_overdue_gates.append(og)
+        relevant_feature_ids.add(og.feature_id)
+      elif remaining == -slo_limit:
+        long_overdue_gates.append(og)
+        relevant_feature_ids.add(og.feature_id)
+
+    relevant_features = {
+        fe_id: FeatureEntry.get_by_id(fe_id)
+        for fe_id in relevant_feature_ids}
+    return newly_overdue_gates, long_overdue_gates, relevant_features
+
+  def build_gate_email_tasks(
+      self,
+      gates_to_notify: list[Gate],
+      relevant_features: dict[int, FeatureEntry],
+      is_escalated: bool
+  ) -> list[dict[str, Any]]:
+    email_tasks: list[dict[str, Any]] = []
+    for gate in gates_to_notify:
+      gate_id = gate.key.integer_id()
+      appr_def = approval_defs.APPROVAL_FIELDS_BY_ID[gate.gate_type]
+      fe = relevant_features[gate.feature_id]
+      feature_id = fe.key.integer_id()
+      gate_url = settings.SITE_URL + f'feature/{feature_id}?gate={gate_id}'
+      body_data = {
+          'feature': fe,
+          'appr_def': appr_def,
+          'gate_url': gate_url,
+          'is_escalated': is_escalated,
+      }
+      html = render_template(self.BODY_TEMPLATE_PATH, **body_data)
+      subject = self.SUBJECT_FORMAT % fe.name
+      if is_escalated:
+        subject = f'ESCALATED: {subject}'
+      recipients = self.choose_reviewers(gate, is_escalated)
+      for recipient in recipients:
+        email_tasks.append({
+            'to': recipient,
+            'subject': subject,
+            'reply_to': None,
+            'html': html
+        })
+    return email_tasks
+
+  def choose_reviewers(self, gate: Gate, is_escalated: bool) -> list[str]:
+    """Decide who to notify that a review is overdue."""
+    if not is_escalated and gate.assignee_emails:
+      return gate.assignee_emails
+
+    review_team = approval_defs.get_approvers(gate.gate_type)
+    assignees = gate.assignee_emails or []
+    return list(set(assignees + review_team))
+
+
+class SendOTReminderEmailsHandler(basehandlers.FlaskHandler):
+  def get_template_data(self, **kwargs):
+    """Send any time-based origin trials reminder emails."""
+    self.require_cron_header()
+    return ot_process_reminders.send_email_reminders()

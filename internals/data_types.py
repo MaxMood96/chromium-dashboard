@@ -17,7 +17,8 @@
 # https://stackoverflow.com/a/33533514
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from dataclasses import dataclass
+from typing import Any, NotRequired, TypedDict
 
 # List of changed fields to be used to create Activity entities
 # and notify subscribed users of changes to a feature.
@@ -43,12 +44,26 @@ class StageDict(TypedDict):
   experiment_risks: str | None
   extensions: list[StageDict]  # type: ignore
   origin_trial_feedback_url: str | None
+  ot_action_requested: bool
+  ot_activation_date: NotRequired[str | None]
+  ot_approval_buganizer_component: int | None
+  ot_approval_buganizer_custom_field_id: int | None
+  ot_approval_criteria_url: str | None
+  ot_approval_group_email: str | None
   ot_chromium_trial_name: str | None
+  ot_description: str | None
+  ot_display_name: str | None
   ot_documentation_url: str | None
+  ot_emails: list[str]
+  ot_feedback_submission_url: str | None
   ot_has_third_party_support: bool
   ot_is_critical_trial: bool
   ot_is_deprecation_trial: bool
+  ot_owner_email: str | None
+  ot_require_approvals: bool
+  ot_setup_status: NotRequired[int]
   ot_webfeature_use_counter: str | None
+  ot_request_note: NotRequired[str]
 
   # Trial extension specific fields.
   ot_stage_id: int | None
@@ -198,7 +213,10 @@ class VerboseFeatureDict(TypedDict):
   bug_url: str | None
   launch_bug_url: str | None
   screenshot_links: list[str]
+  first_enterprise_notification_milestone: int | None
   breaking_change: bool
+  enterprise_impact: int
+  shipping_year: int | None
 
   # Implementation in Chrome
   flag_name: str | None
@@ -269,3 +287,43 @@ class VerboseFeatureDict(TypedDict):
   is_enterprise_feature: bool
   updated_display: str | None
   new_crbug_url: str | None
+
+
+@dataclass
+class OriginTrialInfo():
+  def __init__(self, api_trial):
+    self.id = api_trial.get('id', None)
+    self.display_name = api_trial.get('displayName', None)
+    self.description = api_trial.get('description', None)
+    self.origin_trial_feature_name = api_trial.get('originTrialFeatureName', None)
+    self.enabled = api_trial.get('enabled', False)
+    self.status = api_trial.get('status', None)
+    self.chromestatus_url = api_trial.get('chromestatusUrl', None)
+    self.start_milestone = api_trial.get('startMilestone', None)
+    self.end_milestone = api_trial.get('endMilestone', None)
+    self.original_end_milestone = api_trial.get('originalEndMilestone', None)
+    self.end_time = api_trial.get('endTime', None)
+    self.documentation_url = api_trial.get('documentationUrl', None)
+    self.feedback_url = api_trial.get('feedbackUrl', None)
+    self.intent_to_experiment_url = api_trial.get('intentToExperimentUrl', None)
+    self.trial_extensions = api_trial.get('trialExtensions', None)
+    self.type = api_trial.get('type', None)
+    self.allow_third_party_origins = api_trial.get('allowThirdPartyOrigins', False)
+
+  id: str|None
+  display_name: str|None
+  description: str|None
+  origin_trial_feature_name: str|None
+  enabled: bool
+  status: str|None
+  chromestatus_url: str|None
+  start_milestone: str|None
+  end_milestone: str|None
+  original_end_milestone: str|None
+  end_time: str|None
+  documentation_url: str|None
+  feedback_url: str|None
+  intent_to_experiment_url: str|None
+  trial_extensions: list|None
+  type: str|None
+  allow_third_party_origins: bool

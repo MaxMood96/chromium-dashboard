@@ -17,6 +17,7 @@ import collections
 import flask
 import json
 import testing_config  # Must be imported before the module under test.
+import werkzeug.exceptions  # Flask HTTP stuff.
 from unittest import mock
 
 from google.appengine.api import mail
@@ -28,6 +29,29 @@ from framework import sendemail
 
 test_app = flask.Flask(__name__)
 
+class FunctionTests(testing_config.CustomTestCase):
+
+  def test_get_param__simple(self):
+    """We can simply get a JSON parameter, with defaults."""
+    with test_app.test_request_context('/test', json={'x': 1}):
+      self.assertEqual(
+          1,
+          sendemail.get_param(flask.request, 'x'))
+      self.assertEqual(
+          None,
+          sendemail.get_param(flask.request, 'missing', required=False))
+
+  @mock.patch('flask.abort')
+  def test_get_param__missing_required(self, mock_abort):
+    """If a required param is missing, we abort."""
+    mock_abort.side_effect = werkzeug.exceptions.BadRequest
+
+    with test_app.test_request_context('/test', json={'x': 1}):
+      with self.assertRaises(werkzeug.exceptions.BadRequest):
+        sendemail.get_param(flask.request, 'missing')
+    mock_abort.assert_called_once_with(
+        400, description="Missing parameter 'missing'")
+
 
 class OutboundEmailHandlerTest(testing_config.CustomTestCase):
 
@@ -36,6 +60,7 @@ class OutboundEmailHandlerTest(testing_config.CustomTestCase):
 
     self.to = 'user@example.com'
     self.subject = 'test subject'
+    self.cc = ['another_user@example.com']
     self.html = '<b>body</b>'
     self.sender = ('Chromestatus <admin@%s.appspotmail.com>' %
                    settings.APP_ID)
@@ -48,6 +73,7 @@ class OutboundEmailHandlerTest(testing_config.CustomTestCase):
     """On cr-status, we send emails to real users."""
     params = {
         'to': self.to,
+        'cc': self.cc,
         'subject': self.subject,
         'html': self.html,
         'references': self.refs,
@@ -56,7 +82,7 @@ class OutboundEmailHandlerTest(testing_config.CustomTestCase):
       actual_response = sendemail.handle_outbound_mail_task()
 
     mock_emailmessage_constructor.assert_called_once_with(
-        sender=self.sender, to=self.to, subject=self.subject,
+        sender=self.sender, to=[self.to], subject=self.subject,
         html=self.html)
     mock_message = mock_emailmessage_constructor.return_value
     mock_message.check_initialized.assert_called_once_with()
@@ -64,6 +90,7 @@ class OutboundEmailHandlerTest(testing_config.CustomTestCase):
     self.assertEqual({'message': 'Done'}, actual_response)
     self.assertEqual(self.refs, mock_message.headers['References'])
     self.assertEqual(self.refs, mock_message.headers['In-Reply-To'])
+    self.assertEqual(self.cc, mock_message.cc)
 
   @mock.patch('settings.SEND_EMAIL', True)
   @mock.patch('google.appengine.api.mail.EmailMessage')
@@ -71,6 +98,7 @@ class OutboundEmailHandlerTest(testing_config.CustomTestCase):
     """On cr-status-staging, we send emails to an archive."""
     params = {
         'to': self.to,
+        'cc': self.cc,
         'subject': self.subject,
         'html': self.html,
         }
@@ -79,7 +107,7 @@ class OutboundEmailHandlerTest(testing_config.CustomTestCase):
 
     expected_to = 'cr-status-staging-emails+user+example.com@google.com'
     mock_emailmessage_constructor.assert_called_once_with(
-        sender=self.sender, to=expected_to, subject=self.subject,
+        sender=self.sender, to=[expected_to], subject=self.subject,
         html=self.html)
     mock_message = mock_emailmessage_constructor.return_value
     mock_message.check_initialized.assert_called_once_with()
@@ -92,6 +120,7 @@ class OutboundEmailHandlerTest(testing_config.CustomTestCase):
     """When running locally, we don't actually send emails."""
     params = {
         'to': self.to,
+        'cc': self.cc,
         'subject': self.subject,
         'html': self.html,
         }
@@ -99,12 +128,15 @@ class OutboundEmailHandlerTest(testing_config.CustomTestCase):
       actual_response = sendemail.handle_outbound_mail_task()
 
     expected_to = 'cr-status-staging-emails+user+example.com@google.com'
+    expected_cc = [
+        'cr-status-staging-cc-emails+another_user+example.com@google.com']
     mock_emailmessage_constructor.assert_called_once_with(
-        sender=self.sender, to=expected_to, subject=self.subject,
+        sender=self.sender, to=[expected_to], subject=self.subject,
         html=self.html)
     mock_message = mock_emailmessage_constructor.return_value
     mock_message.check_initialized.assert_called_once_with()
     mock_message.send.assert_not_called()
+    self.assertEqual(expected_cc, mock_message.cc)
     self.assertEqual({'message': 'Done'}, actual_response)
 
 

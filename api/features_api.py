@@ -24,6 +24,7 @@ from framework import basehandlers
 from framework import permissions
 from framework import rediscache
 from framework import users
+from internals.enterprise_helpers import *
 from internals.core_enums import *
 from internals.core_models import FeatureEntry, MilestoneSet, Stage
 from internals.data_types import CHANGED_FIELDS_LIST_TYPE
@@ -34,6 +35,7 @@ from internals.data_types import VerboseFeatureDict
 from internals import feature_helpers
 from internals import search
 from internals import search_fulltext
+from internals import stage_helpers
 from internals.user_models import AppUser
 import settings
 
@@ -47,76 +49,8 @@ URL_RE = re.compile(r'\b%s%s%s\b' % (
 ALLOWED_SCHEMES = [None, 'http', 'https']
 
 
-class FeaturesAPI(basehandlers.APIHandler):
+class FeaturesAPI(basehandlers.EntitiesAPIHandler):
   """Features are the the main records that we track."""
-
-  def _abort_invalid_data_type(
-      self, field: str, field_type: str, value: Any) -> None:
-    """Abort the process if an invalid data type is given."""
-    self.abort(400, msg=(
-        f'Bad value for field {field} of type {field_type}: {value}'))
-
-  def _extract_link(self, s):
-    if s:
-      match_obj = URL_RE.search(str(s))
-      if match_obj and match_obj.group('scheme') in ALLOWED_SCHEMES:
-        link = match_obj.group()
-        if not link.startswith(('http://', 'https://')):
-          link = 'http://' + link
-        return link
-
-    return None
-
-  def _split_list_input(
-      self,
-      field: str,
-      field_type: str,
-      value: str,
-      delimiter: str='\\r?\\n'
-    ) -> list[str]:
-    try:
-      formatted_list = [
-        x.strip() for x in re.split(delimiter, value) if x.strip()]
-    except TypeError:
-      self._abort_invalid_data_type(field, field_type, value)
-    return formatted_list
-
-  def _format_field_val(
-      self,
-      field: str,
-      field_type: str,
-      value: Any,
-    ) -> str | int | bool | list | None:
-    """Format the given feature value based on the field type."""
-
-    # If the field is empty, no need to format.
-    if value is None:
-      return None
-
-    # TODO(DanielRyanSmith): Write checks to ensure enum values are valid.
-    if field_type == 'emails' or field_type == 'split_str':
-      list_val = self._split_list_input(field, field_type, value, ',')
-      if field == 'blink_components' and len(value) == 0:
-        return [settings.DEFAULT_COMPONENT]
-      return list_val
-    elif field_type == 'link':
-      return self._extract_link(value)
-    elif field_type == 'links':
-      list_val = self._split_list_input(field, field_type, value)
-      # Filter out any URLs that do not conform to the proper pattern.
-      return [self._extract_link(link)
-              for link in list_val if link]
-    elif field_type == 'int':
-      # Int fields can be unset by giving null or nothing in the input field.
-      if value == '' or value is None:
-        return None
-      try:
-        return int(value)
-      except ValueError:
-        self._abort_invalid_data_type(field, field_type, value)
-    elif field_type == 'bool':
-      return bool(value)
-    return str(value)
 
   def get_one_feature(self, feature_id: int) -> VerboseFeatureDict:
     feature = FeatureEntry.get_by_id(feature_id)
@@ -144,16 +78,28 @@ class FeaturesAPI(basehandlers.APIHandler):
           'total_count': total_count,
           }
 
+    # Query-string parameter 'releaseNotesMilestone' is provided
+    release_notes_milestone = self.get_int_arg('releaseNotesMilestone')
+    if release_notes_milestone:
+      features_in_release_notes = feature_helpers.get_features_in_release_notes(
+        milestone=release_notes_milestone)
+      return {
+        'features': features_in_release_notes,
+        'total_count': len(features_in_release_notes)
+        }
+
     user_query = self.request.args.get('q', '')
     sort_spec = self.request.args.get('sort')
     num = self.get_int_arg('num', search.DEFAULT_RESULTS_PER_PAGE)
     start = self.get_int_arg('start', 0)
+    name_only = self.get_bool_arg('name_only', False)
 
-    show_enterprise = 'feature_type' in user_query
+    show_enterprise = (
+        'feature_type' in user_query or self.get_bool_arg('showEnterprise'))
     try:
-      features_on_page, total_count = search.process_query(
+      features_on_page, total_count = search.process_query_using_cache(
           user_query, sort_spec=sort_spec, show_unlisted=show_unlisted_features,
-          show_enterprise=show_enterprise, start=start, num=num)
+          show_enterprise=show_enterprise, start=start, num=num, name_only=name_only)
     except ValueError as err:
       self.abort(400, msg=str(err))
 
@@ -185,8 +131,15 @@ class FeaturesAPI(basehandlers.APIHandler):
     fields_dict = {}
     for field, field_type in api_specs.FEATURE_FIELD_DATA_TYPES:
       if field in body:
-        fields_dict[field] = self._format_field_val(
+        fields_dict[field] = self.format_field_val(
             field, field_type, body[field])
+
+    # If no enterprise notification milestone was set, set one since it will be shown in the next
+    # release notes by default. This is true for breaking changes and enterprise features only.
+    if ('first_enterprise_notification_milestone' in body):
+      fields_dict['first_enterprise_notification_milestone'] = body['first_enterprise_notification_milestone']
+    elif needs_default_first_notification_milestone(new_fields=body):
+      fields_dict['first_enterprise_notification_milestone'] = get_default_first_notice_milestone_for_feature()
 
     # Try to create the feature using the provided data.
     try:
@@ -224,23 +177,13 @@ class FeaturesAPI(basehandlers.APIHandler):
       if new_gates:
         ndb.put_multi(new_gates)
 
-  def _update_field_value(
-      self,
-      entity: FeatureEntry | MilestoneSet | Stage,
-      field: str,
-      field_type: str,
-      value: Any
-    ) -> None:
-    new_value = self._format_field_val(field, field_type, value)
-    setattr(entity, field, new_value)
-
   def _patch_update_stages(
       self,
       stage_changes_list: list[dict[str, Any]],
       changed_fields: CHANGED_FIELDS_LIST_TYPE
-    ) -> bool:
+    ) -> list[Stage]:
     """Update stage fields with changes provided in the PATCH request."""
-    stages: list[Stage] = []
+    stages_to_store: list[Stage] = []
     for change_info in stage_changes_list:
       stage_was_updated = False
       # Check if valid ID is provided and fetch stage if it exists.
@@ -256,10 +199,13 @@ class FeaturesAPI(basehandlers.APIHandler):
         if field not in change_info:
           continue
         form_field_name = change_info[field]['form_field_name']
+
         old_value = getattr(stage, field)
         new_value = change_info[field]['value']
-        self._update_field_value(stage, field, field_type, new_value)
-        changed_fields.append((form_field_name, old_value, new_value))
+        self.update_field_value(stage, field, field_type, new_value)
+        # The OT additional details does not need to be sent to subscribers.
+        if form_field_name != 'ot_request_note':
+          changed_fields.append((form_field_name, old_value, new_value))
         stage_was_updated = True
 
       # Update milestone fields.
@@ -272,35 +218,73 @@ class FeaturesAPI(basehandlers.APIHandler):
         form_field_name = change_info[field]['form_field_name']
         old_value = getattr(milestones, field)
         new_value = change_info[field]['value']
-        self._update_field_value(milestones, field, field_type, new_value)
+        self.update_field_value(milestones, field, field_type, new_value)
         changed_fields.append((form_field_name, old_value, new_value))
         stage_was_updated = True
       stage.milestones = milestones
 
       if stage_was_updated:
-        stages.append(stage)
+        stages_to_store.append(stage)
 
     # Save all of the updates made.
-    # Return a boolean representing if any changes were made to any stages.
-    if stages:
-      ndb.put_multi(stages)
-      return True
-    return False
+    if stages_to_store:
+      ndb.put_multi(stages_to_store)
+
+    # Return the list of modified stages.
+    return stages_to_store
 
   def _patch_update_special_fields(
       self,
       feature: FeatureEntry,
       feature_changes: dict[str, Any],
-      has_updated: bool
+      has_updated: bool,
+      updated_stages: list[Stage],
+      changed_fields: CHANGED_FIELDS_LIST_TYPE,
     ) -> None:
     """Handle any special FeatureEntry fields."""
     now = datetime.now()
-    # Handle accuracy notifications if this is an accuracy verification request.
+    # Set accurate_as_of if this is an accuracy verification request.
     if 'accurate_as_of' in feature_changes:
       feature.accurate_as_of = now
       feature.outstanding_notifications = 0
       has_updated = True
 
+    # Set enterprise first notification milestones.
+    if is_update_first_notification_milestone(feature, feature_changes):
+      feature.first_enterprise_notification_milestone = int(feature_changes['first_enterprise_notification_milestone'])
+      has_updated = True
+    elif needs_default_first_notification_milestone(feature, feature_changes):
+      feature.first_enterprise_notification_milestone = get_default_first_notice_milestone_for_feature()
+      has_updated = True
+    if should_remove_first_notice_milestone(feature, feature_changes):
+      feature.first_enterprise_notification_milestone = None
+
+    # If a shipping stage was edited, set shipping_year based on milestones.
+    updated_shipping_stages = [
+        us for us in updated_stages
+        if us.stage_type in STAGE_TYPES_SHIPPING.values()]
+    if updated_shipping_stages:
+      existing_shipping_stages = (
+          stage_helpers.get_all_shipping_stages_with_milestones(
+              feature_id=feature.key.integer_id()))
+      shipping_stage_dict = {
+          es.key.integer_id(): es
+          for es in existing_shipping_stages
+      }
+      shipping_stage_dict.update({
+          uss.key.integer_id(): uss
+          for uss in updated_shipping_stages
+      })
+      earliest = stage_helpers.find_earliest_milestone(
+          list(shipping_stage_dict.values()))
+      if earliest:
+          year = stage_helpers.look_up_year(earliest)
+          if year != feature.shipping_year:
+            changed_fields.append(('shipping_year', feature.shipping_year, year))
+            feature.shipping_year = year
+            has_updated = True
+
+    # If changes were made, set the feature.updated timestamp.
     if has_updated:
       user_email = self.get_current_user().email()
       feature.updater_email = user_email
@@ -310,20 +294,22 @@ class FeaturesAPI(basehandlers.APIHandler):
       self,
       feature: FeatureEntry,
       feature_changes: dict[str, Any],
-      has_updated: bool,
+      updated_stages: list[Stage],
       changed_fields: CHANGED_FIELDS_LIST_TYPE
     ) -> None:
     """Update feature fields with changes provided in the PATCH request."""
+    has_updated = len(updated_stages) > 0
     for field, field_type in api_specs.FEATURE_FIELD_DATA_TYPES:
       if field not in feature_changes:
         continue
       old_value = getattr(feature, field)
       new_value = feature_changes[field]
-      self._update_field_value(feature, field, field_type, new_value)
+      self.update_field_value(feature, field, field_type, new_value)
       changed_fields.append((field, old_value, new_value))
       has_updated = True
 
-    self._patch_update_special_fields(feature, feature_changes, has_updated)
+    self._patch_update_special_fields(
+        feature, feature_changes, has_updated, updated_stages, changed_fields)
     feature.put()
 
   def do_patch(self, **kwargs):
@@ -345,14 +331,15 @@ class FeaturesAPI(basehandlers.APIHandler):
       return redirect_resp
 
     changed_fields: CHANGED_FIELDS_LIST_TYPE = []
-    has_updated = self._patch_update_stages(body['stages'], changed_fields)
+    updated_stages = self._patch_update_stages(body['stages'], changed_fields)
     self._patch_update_feature(
-      feature, body['feature_changes'], has_updated, changed_fields)
+      feature, body['feature_changes'], updated_stages, changed_fields)
 
     notifier_helpers.notify_subscribers_and_save_amendments(
         feature, changed_fields, notify=True)
     # Remove all feature-related cache.
-    rediscache.delete_keys_with_prefix(FeatureEntry.feature_cache_prefix())
+    rediscache.delete_keys_with_prefix(FeatureEntry.DEFAULT_CACHE_KEY)
+    rediscache.delete_keys_with_prefix(FeatureEntry.SEARCH_CACHE_KEY)
     # Update full-text index.
     if feature:
       search_fulltext.index_feature(feature)
@@ -376,7 +363,8 @@ class FeaturesAPI(basehandlers.APIHandler):
       self.abort(403)
     feature.deleted = True
     feature.put()
-    rediscache.delete_keys_with_prefix(FeatureEntry.feature_cache_prefix())
+    rediscache.delete_keys_with_prefix(FeatureEntry.DEFAULT_CACHE_KEY)
+    rediscache.delete_keys_with_prefix(FeatureEntry.SEARCH_CACHE_KEY)
 
     # Write for new FeatureEntry entity.
     feature_entry: FeatureEntry | None = (
