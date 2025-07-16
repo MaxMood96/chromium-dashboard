@@ -30,7 +30,7 @@ Werkzeug==3.0.6
 click==8.1.8
 itsdangerous==2.1.2
 ghapi==1.0.6
-validators==0.20.0
+validators==0.21.0
 # Work-around for failure to deploy
 # https://stackoverflow.com/questions/69936420/google-cloud-platform-app-deploy-failure-due-to-pyparsing
 pyparsing==3.2.3
@@ -39,3 +39,6 @@ pillow==11.0.0
 ./gen/py/chromestatus_openapi
 ./gen/py/webstatus_openapi
 types-python-dateutil==2.9.0.20250708
+protobuf>=4.25.8 # not directly required, pinned by Snyk to avoid a vulnerability
+urllib3>=2.5.0 # not directly required, pinned by Snyk to avoid a vulnerability
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
