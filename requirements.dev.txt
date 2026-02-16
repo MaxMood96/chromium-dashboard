@@ -13,3 +13,4 @@ types-redis
 types-requests
 types-setuptools
 types-pytz
+urllib3>=2.5.0 # not directly required, pinned by Snyk to avoid a vulnerability
