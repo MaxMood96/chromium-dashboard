@@ -17,3 +17,4 @@ pytest==9.0.3
 pytest-xdist==3.6.1
 requests==2.33.1
 ruff
+cryptography>=46.0.6 # not directly required, pinned by Snyk to avoid a vulnerability
