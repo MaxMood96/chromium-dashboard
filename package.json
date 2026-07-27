@@ -71,7 +71,7 @@
     "@types/node": "^26.1.2",
     "@web/test-runner": "^1.0.0",
     "@web/test-runner-playwright": "^1.0.0",
-    "@web/test-runner-puppeteer": "^0.18.0",
+    "@web/test-runner-puppeteer": "^1.0.1",
     "acorn": ">=8.17.0",
     "color-string": ">=2.1.4",
     "dot-prop": ">=10.1.0",
@@ -91,7 +91,7 @@
     "rollup": "^4.62.2",
     "rollup-plugin-css-only": "^4.5.5",
     "sinon": "^22.1.0",
-    "tar": ">=7.5.20",
+    "tar": ">=7.5.21",
     "trim-newlines": ">=5.0.0",
     "ts-lit-plugin": "^2.0.2",
     "typescript": "^6.0.3"
